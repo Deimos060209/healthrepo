@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="HealthRepo">
+  <rect width="512" height="512" rx="112" fill="#0d9488"/>
+  <path d="M168 132h56v92h64v-92h56v248h-56v-100h-64v100h-56z" fill="#ffffff"/>
+  <path d="M356 96h40v40h40v40h-40v40h-40v-40h-40v-40h40z" fill="#99f6e4"/>
+</svg>

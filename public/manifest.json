@@ -1,0 +1,26 @@
+{
+  "name": "HealthRepo",
+  "short_name": "HealthRepo",
+  "description": "Your Health. Your Right. Your Repo. — photograph a packaged product to check Legal Metrology compliance and screen its ingredients for harmful or banned substances.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#ffffff",
+  "theme_color": "#0d9488",
+  "categories": ["health", "shopping", "utilities"],
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "192x192 512x512 any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "/icon-maskable.svg",
+      "sizes": "192x192 512x512 any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}
