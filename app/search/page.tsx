@@ -10,14 +10,37 @@ import {
   Star,
   ChevronLeft,
   ArrowLeft,
+  ShieldCheck,
+  FlaskConical,
+  RotateCcw,
+  FileText,
+  Microscope,
 } from "lucide-react";
 import { ResultRowSkeleton } from "@/components/Skeleton";
 import { supabase } from "@/lib/supabase";
 import { PRODUCT_CATEGORIES } from "@/lib/reference-data";
+import {
+  BROAD_CATEGORY_FILTERS,
+  categoryScoreThreshold,
+} from "@/lib/product-category";
 import type { IngredientAnalysis } from "@/types/analysis";
+import {
+  fetchHealthProfile,
+  isHealthProfileEmpty,
+  type HealthProfile,
+} from "@/lib/health-profile";
+import {
+  dedupeSafeProducts,
+  profileConcerns,
+  summarizeIngredients,
+  SCORE_FILTER_OPTIONS,
+  type SafeProduct,
+  type SafeProductRow,
+  type ScoreFilterKey,
+} from "@/lib/safe-products";
 
 // ---------------------------------------------------------------------------
-// Types & helpers
+// Shared types & helpers
 // ---------------------------------------------------------------------------
 
 interface SearchRow {
@@ -87,6 +110,556 @@ const STATUS: Record<Flag, { label: string; cls: string }> = {
   },
 };
 
+const catLabelFor = (category: string | null): string => {
+  if (!category) return "Uncategorised";
+  const cat = CATEGORY_MAP.get(category);
+  return cat ? `${cat.icon_emoji} ${cat.name}` : titleCase(category);
+};
+
+// ---------------------------------------------------------------------------
+// Page shell — two tabs
+// ---------------------------------------------------------------------------
+
+type Tab = "safe" | "mine";
+
+export default function SearchPage() {
+  const [tab, setTab] = useState<Tab>("safe");
+
+  return (
+    <main className="mx-auto w-full max-w-3xl flex-1 px-4 pb-28 pt-6 md:pb-12">
+      <header className="flex flex-col gap-3">
+        <Link
+          href="/"
+          className="inline-flex items-center gap-2 text-sm text-zinc-600 hover:text-foreground dark:text-zinc-400"
+        >
+          <ArrowLeft className="h-4 w-4" aria-hidden />
+          Home
+        </Link>
+        <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
+          <Search className="h-6 w-6 text-teal-600" aria-hidden />
+          Search
+        </h1>
+      </header>
+
+      <div
+        role="tablist"
+        aria-label="Search mode"
+        className="mt-4 flex rounded-xl border border-zinc-200 p-1 text-sm dark:border-white/10"
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "safe"}
+          onClick={() => setTab("safe")}
+          className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg px-3 py-2 font-medium transition-colors ${
+            tab === "safe"
+              ? "bg-teal-600 text-white"
+              : "text-zinc-600 dark:text-zinc-400"
+          }`}
+        >
+          <ShieldCheck className="h-4 w-4" aria-hidden />
+          Find safe products
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "mine"}
+          onClick={() => setTab("mine")}
+          className={`flex flex-1 items-center justify-center gap-1.5 rounded-lg px-3 py-2 font-medium transition-colors ${
+            tab === "mine"
+              ? "bg-teal-600 text-white"
+              : "text-zinc-600 dark:text-zinc-400"
+          }`}
+        >
+          <ScanLine className="h-4 w-4" aria-hidden />
+          My scans
+        </button>
+      </div>
+
+      {tab === "safe" ? <SafeProductsTab /> : <MyScansTab />}
+    </main>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// TAB 1 — Find safe products (built from verified scan data)
+// ---------------------------------------------------------------------------
+
+function SafeProductsTab() {
+  const [query, setQuery] = useState("");
+  const [debounced, setDebounced] = useState("");
+  const [category, setCategory] = useState("");
+  // Broad regulatory bucket: "" | "food_and_beverages" | "personal_care" | "household_cleaning" | "baby"
+  const [broadCat, setBroadCat] = useState("");
+  const [scoreKey, setScoreKey] = useState<ScoreFilterKey>("75");
+
+  const [rows, setRows] = useState<SafeProductRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [unavailable, setUnavailable] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
+
+  const [profile, setProfile] = useState<HealthProfile | null>(null);
+
+  // Category-specific "safe" threshold: food 75+, personal care 70+, baby 85+.
+  // The "All safe" score chip maps to that threshold; the stricter chips are
+  // always honoured as-is.
+  const catThreshold = useMemo(
+    () =>
+      broadCat
+        ? categoryScoreThreshold(
+            broadCat === "baby" ? "baby_product_food" : broadCat,
+          )
+        : 75,
+    [broadCat],
+  );
+  const minScore = useMemo(() => {
+    const base = SCORE_FILTER_OPTIONS.find((o) => o.key === scoreKey)?.min ?? 75;
+    return scoreKey === "75" ? catThreshold : base;
+  }, [scoreKey, catThreshold]);
+  const term = sanitize(debounced);
+
+  useEffect(() => {
+    let alive = true;
+    fetchHealthProfile().then((p) => {
+      if (alive) setProfile(isHealthProfileEmpty(p) ? null : p);
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    const t = window.setTimeout(() => setDebounced(query), 500);
+    return () => window.clearTimeout(t);
+  }, [query]);
+
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setUnavailable(false);
+
+    (async () => {
+      const params: Record<string, unknown> = {
+        search_query: term,
+        category_filter: category,
+        min_score: minScore,
+      };
+      // Only pass the broad-category arg when it's in use — keeps the call
+      // working against the pre-category deployment of search_safe_products.
+      if (broadCat) params.detected_category_filter = broadCat;
+
+      const { data, error } = await supabase.rpc("search_safe_products", params);
+      if (!alive) return;
+      if (error) {
+        setUnavailable(true);
+        setRows([]);
+      } else {
+        setRows((data ?? []) as SafeProductRow[]);
+      }
+      setLoading(false);
+    })();
+
+    return () => {
+      alive = false;
+    };
+  }, [term, category, minScore, broadCat, reloadKey]);
+
+  const products = useMemo(() => {
+    const all = dedupeSafeProducts(rows);
+    if (!broadCat) return all;
+    const bucket = BROAD_CATEGORY_FILTERS.find((b) => b.key === broadCat);
+    if (!bucket) return all;
+    // Belt-and-braces client filter (older rows have no detected_category).
+    return all.filter((p) => bucket.match.includes(p.categoryId));
+  }, [rows, broadCat]);
+  const safestInCategory = useMemo(
+    () => (category ? products.slice(0, 5) : []),
+    [products, category],
+  );
+  const broadCatLabel = broadCat
+    ? (BROAD_CATEGORY_FILTERS.find((b) => b.key === broadCat)?.label ?? "")
+    : "";
+  const activeCatName = category
+    ? (CATEGORY_MAP.get(category)?.name ?? titleCase(category))
+    : broadCatLabel;
+
+  return (
+    <section className="mt-5 flex flex-col gap-4">
+      <div>
+        <h2 className="text-lg font-semibold">
+          Products verified safe by HealthRepo scans
+        </h2>
+        <p className="text-sm text-zinc-600 dark:text-zinc-400">
+          Every product here was scanned and verified by real users.
+        </p>
+      </div>
+
+      {/* Search bar */}
+      <div className="relative">
+        <Search
+          className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-zinc-400"
+          aria-hidden
+        />
+        <input
+          type="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") setDebounced(query);
+          }}
+          placeholder="Search verified safe products..."
+          className="w-full rounded-2xl border border-zinc-300 bg-transparent py-3 pl-11 pr-10 text-sm text-foreground placeholder:text-zinc-400 focus:border-teal-500 focus:outline-none focus:ring-1 focus:ring-teal-500 dark:border-white/15"
+        />
+        {query && (
+          <button
+            type="button"
+            aria-label="Clear search"
+            onClick={() => {
+              setQuery("");
+              setDebounced("");
+            }}
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded-full p-1 text-zinc-400 hover:text-foreground"
+          >
+            <X className="h-4 w-4" aria-hidden />
+          </button>
+        )}
+      </div>
+
+      {/* Broad regulatory category — food / personal care / household / baby */}
+      <div className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-1">
+        <FilterChip active={broadCat === ""} onClick={() => setBroadCat("")}>
+          All types
+        </FilterChip>
+        {BROAD_CATEGORY_FILTERS.map((b) => (
+          <FilterChip
+            key={b.key}
+            active={broadCat === b.key}
+            onClick={() => setBroadCat(broadCat === b.key ? "" : b.key)}
+          >
+            <span aria-hidden>{b.emoji}</span> {b.label}
+          </FilterChip>
+        ))}
+      </div>
+
+      {/* Category filter chips */}
+      <div className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-1">
+        <FilterChip active={category === ""} onClick={() => setCategory("")}>
+          All
+        </FilterChip>
+        {PRODUCT_CATEGORIES.map((c) => (
+          <FilterChip
+            key={c.id}
+            active={category === c.id}
+            onClick={() => setCategory(category === c.id ? "" : c.id)}
+          >
+            <span aria-hidden>{c.icon_emoji}</span> {c.name}
+          </FilterChip>
+        ))}
+      </div>
+
+      {/* Score filter */}
+      <div className="flex flex-wrap gap-1.5">
+        {SCORE_FILTER_OPTIONS.map((o) => (
+          <FilterChip
+            key={o.key}
+            active={scoreKey === o.key}
+            onClick={() => setScoreKey(o.key)}
+          >
+            {o.label}
+          </FilterChip>
+        ))}
+      </div>
+
+      {/* Accuracy messaging */}
+      <div className="rounded-2xl border border-teal-500/30 bg-teal-500/[0.06] p-3 text-xs text-teal-800 dark:text-teal-200">
+        <ul className="flex flex-col gap-1">
+          <li>
+            These recommendations are based on <strong>actual scanned
+            products</strong>, not estimates.
+          </li>
+          <li>
+            Safety scores are calculated by analysing real ingredient lists
+            against FSSAI regulations.
+          </li>
+          <li>
+            The more products the community scans, the better our
+            recommendations get.
+          </li>
+          {broadCat && (
+            <li>
+              {broadCatLabel} products are recommended at{" "}
+              <strong>{catThreshold}+</strong>
+              {broadCat === "personal_care"
+                ? " (a lower bar — most personal-care products carry some processing)"
+                : broadCat === "baby"
+                  ? " (a stricter bar — baby products get zero tolerance)"
+                  : ""}
+              .
+            </li>
+          )}
+        </ul>
+      </div>
+
+      {profile && (
+        <p className="rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+          Cards below are also checked against your{" "}
+          <Link
+            href="/profile/health"
+            className="font-medium underline underline-offset-2"
+          >
+            health profile
+          </Link>
+          .
+        </p>
+      )}
+
+      {unavailable && !loading && (
+        <div className="flex flex-col items-start gap-3 rounded-2xl border border-red-500/30 bg-red-500/[0.06] p-4 text-sm text-red-700 dark:text-red-300">
+          <p>
+            Safe-product search is unavailable right now. The{" "}
+            <code>search_safe_products</code> database function may not be
+            deployed yet.
+          </p>
+          <button
+            type="button"
+            onClick={() => setReloadKey((k) => k + 1)}
+            className="inline-flex items-center gap-2 rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white"
+          >
+            <RefreshCw className="h-4 w-4" aria-hidden />
+            Try again
+          </button>
+        </div>
+      )}
+
+      {loading && (
+        <ul className="flex flex-col gap-2">
+          {Array.from({ length: 4 }).map((_, i) => (
+            <ResultRowSkeleton key={i} />
+          ))}
+        </ul>
+      )}
+
+      {!loading && !unavailable && products.length === 0 && (
+        <SafeEmptyState category={activeCatName} />
+      )}
+
+      {!loading && category && safestInCategory.length > 0 && (
+        <div className="rounded-2xl border border-green-500/30 bg-green-500/[0.05] p-4">
+          <h3 className="text-sm font-semibold text-green-700 dark:text-green-300">
+            🌟 Safest in {activeCatName}
+          </h3>
+          <ul className="mt-3 flex flex-col gap-2">
+            {safestInCategory.map((p) => (
+              <SafeProductCard key={p.id} product={p} profile={profile} compact />
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {!loading && products.length > 0 && (
+        <ul className="flex flex-col gap-3">
+          {products.map((p) => (
+            <SafeProductCard key={p.id} product={p} profile={profile} />
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function FilterChip({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`shrink-0 whitespace-nowrap rounded-full border px-3 py-1.5 text-xs font-medium transition-colors ${
+        active
+          ? "border-teal-500 bg-teal-600 text-white"
+          : "border-zinc-200 text-zinc-600 hover:border-teal-300 dark:border-white/10 dark:text-zinc-400"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function SafeProductCard({
+  product,
+  profile,
+  compact = false,
+}: {
+  product: SafeProduct;
+  profile: HealthProfile | null;
+  compact?: boolean;
+}) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const badge = scoreBadge(product.score);
+  const summary = useMemo(
+    () => summarizeIngredients(product.ingredients),
+    [product.ingredients],
+  );
+  const concerns = useMemo(
+    () => profileConcerns(product.ingredients, profile),
+    [product.ingredients, profile],
+  );
+  const hasCriticalConcern = concerns.some((c) => c.severity === "critical");
+
+  return (
+    <li
+      className={`rounded-2xl border p-4 ${
+        concerns.length > 0
+          ? "border-amber-400/60 bg-amber-50/40 dark:border-amber-500/40 dark:bg-amber-500/[0.06]"
+          : "border-zinc-200 dark:border-white/10"
+      }`}
+    >
+      <div className="flex items-start gap-3">
+        {product.imageUrl && !imageFailed ? (
+          <span className="relative h-14 w-14 shrink-0">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              src={product.imageUrl}
+              alt={product.name}
+              loading="lazy"
+              decoding="async"
+              onError={() => setImageFailed(true)}
+              className="h-14 w-14 rounded-lg object-cover"
+            />
+            <span
+              className={`absolute -bottom-1 -right-1 flex h-6 w-6 items-center justify-center rounded-full text-[11px] font-bold text-white ring-2 ring-white dark:ring-zinc-900 ${badge.bg}`}
+            >
+              {badge.value}
+            </span>
+          </span>
+        ) : (
+          <span
+            className={`flex h-14 w-14 shrink-0 flex-col items-center justify-center rounded-xl text-lg font-bold text-white ${badge.bg}`}
+          >
+            {badge.value}
+            <span className="text-[8px] font-medium opacity-90">/100</span>
+          </span>
+        )}
+
+        <div className="min-w-0 flex-1">
+          <p className="truncate text-sm font-semibold">{product.name}</p>
+          {product.brand && (
+            <p className="truncate text-xs text-zinc-500">{product.brand}</p>
+          )}
+          <p className="mt-0.5 text-xs font-medium text-green-700 dark:text-green-400">
+            ✅ Fully compliant
+          </p>
+          <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[10px]">
+            <span className="rounded-full bg-zinc-100 px-2 py-0.5 font-medium text-zinc-600 dark:bg-white/10 dark:text-zinc-300">
+              {catLabelFor(product.category)}
+            </span>
+            <span className="text-zinc-400">
+              Verified by {product.timesScanned}{" "}
+              {product.timesScanned === 1 ? "scan" : "scans"}
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {!compact && (
+        <ul className="mt-3 flex flex-wrap gap-x-3 gap-y-1 text-xs text-zinc-600 dark:text-zinc-400">
+          <li>
+            <span className="font-semibold text-green-700 dark:text-green-400">
+              {summary.safe}
+            </span>{" "}
+            safe
+            {summary.concerning > 0 && (
+              <>
+                {" · "}
+                <span className="font-semibold text-amber-700 dark:text-amber-400">
+                  {summary.concerning}
+                </span>{" "}
+                concerning
+              </>
+            )}
+          </li>
+          {summary.noBanned && <li>✅ No banned ingredients</li>}
+          {summary.noHarmfulAdditives && <li>✅ No harmful additives</li>}
+        </ul>
+      )}
+
+      {/* Health-profile verdict */}
+      {profile && concerns.length === 0 && (
+        <p className="mt-2 inline-flex items-center gap-1 rounded-full bg-green-100 px-2 py-0.5 text-[11px] font-medium text-green-700 dark:bg-green-500/15 dark:text-green-300">
+          ✅ Safe for your profile
+        </p>
+      )}
+      {concerns.length > 0 && (
+        <div className="mt-2 rounded-xl bg-amber-500/10 p-2.5">
+          <p className="text-[11px] font-semibold text-amber-800 dark:text-amber-300">
+            {hasCriticalConcern ? "🔴" : "⚠️"} Has concerns for your profile
+          </p>
+          <ul className="mt-1 list-disc space-y-0.5 pl-4 text-[11px] text-amber-800 dark:text-amber-200">
+            {concerns.map((c, i) => (
+              <li key={i}>{c.message}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        <Link
+          href={`/history/${product.id}`}
+          className="inline-flex items-center gap-1.5 rounded-xl bg-teal-600 px-3 py-1.5 text-xs font-semibold text-white"
+        >
+          <FileText className="h-3.5 w-3.5" aria-hidden />
+          View full report
+        </Link>
+        <Link
+          href={`/scan?verify=${encodeURIComponent(product.name)}`}
+          className="inline-flex items-center gap-1.5 rounded-xl border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 dark:border-white/15 dark:text-zinc-300"
+        >
+          <RotateCcw className="h-3.5 w-3.5" aria-hidden />
+          Re-verify this product
+        </Link>
+      </div>
+    </li>
+  );
+}
+
+function SafeEmptyState({ category }: { category: string }) {
+  return (
+    <div className="flex flex-col items-center gap-2 rounded-2xl border border-zinc-200 p-8 text-center dark:border-white/10">
+      <span className="flex h-16 w-16 items-center justify-center rounded-full bg-teal-600/10 text-teal-600 dark:text-teal-400">
+        <Microscope className="h-8 w-8" aria-hidden />
+      </span>
+      <p className="text-sm font-semibold">
+        🔬 No verified safe products yet
+        {category ? ` in ${category}` : ""}
+      </p>
+      <p className="text-sm text-zinc-600 dark:text-zinc-400">
+        Be the first to scan and verify products!
+      </p>
+      <p className="text-xs text-zinc-500">
+        Every product you scan helps build our safe products database for
+        everyone.
+      </p>
+      <Link
+        href="/scan"
+        className="mt-2 inline-flex items-center gap-2 rounded-2xl bg-teal-600 px-6 py-3 text-sm font-semibold text-white shadow-sm shadow-teal-600/30"
+      >
+        <ScanLine className="h-4 w-4" aria-hidden />
+        Scan a product now →
+      </Link>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// TAB 2 — My scans (the user's own scan history)
+// ---------------------------------------------------------------------------
+
 function groupRows(rows: SearchRow[]): ProductGroup[] {
   const buckets: Record<string, SearchRow[]> = {};
   for (const r of rows) {
@@ -150,11 +723,7 @@ function sortGroups(groups: ProductGroup[], sort: SortKey): ProductGroup[] {
   return g;
 }
 
-// ---------------------------------------------------------------------------
-// Page
-// ---------------------------------------------------------------------------
-
-export default function SearchPage() {
+function MyScansTab() {
   const [query, setQuery] = useState("");
   const [debounced, setDebounced] = useState("");
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
@@ -164,7 +733,6 @@ export default function SearchPage() {
   const [catCounts, setCatCounts] = useState<Record<string, number>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [scopeNote, setScopeNote] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
   const term = sanitize(debounced);
@@ -174,19 +742,16 @@ export default function SearchPage() {
       ? "category"
       : "browse";
 
-  // debounce (500ms); Enter commits immediately
   useEffect(() => {
     const t = window.setTimeout(() => setDebounced(query), 500);
     return () => window.clearTimeout(t);
   }, [query]);
 
-  // category counts (once)
+  // category counts (once) — own scans only
   useEffect(() => {
     let alive = true;
     (async () => {
-      let res = await supabase.from("product_search").select("category");
-      if (res.error)
-        res = await supabase.from("scanned_products").select("category");
+      const res = await supabase.from("scanned_products").select("category");
       if (!alive || res.error) return;
       const counts: Record<string, number> = {};
       for (const r of (res.data ?? []) as { category: string | null }[]) {
@@ -199,7 +764,7 @@ export default function SearchPage() {
     };
   }, []);
 
-  // fetch results for search / category modes
+  // fetch results for search / category modes — own scans only (RLS-scoped)
   useEffect(() => {
     if (mode === "browse") {
       setRows([]);
@@ -210,9 +775,9 @@ export default function SearchPage() {
     setLoading(true);
     setError(null);
 
-    const build = (from: "product_search" | "scanned_products") => {
+    (async () => {
       let q = supabase
-        .from(from)
+        .from("scanned_products")
         .select(COLS)
         .order("scanned_at", { ascending: false })
         .limit(500);
@@ -223,27 +788,13 @@ export default function SearchPage() {
       } else if (activeCategory) {
         q = q.eq("category", activeCategory);
       }
-      return q;
-    };
-
-    (async () => {
-      let res = await build("product_search");
-      let scoped = false;
-      if (res.error) {
-        res = await build("scanned_products");
-        scoped = true;
-      }
+      const res = await q;
       if (!alive) return;
       if (res.error) {
         setError("Search is unavailable right now. Please try again.");
         setRows([]);
       } else {
         setRows((res.data ?? []) as unknown as SearchRow[]);
-        setScopeNote(
-          scoped
-            ? "Showing only your own scans — apply the product_search migration for community-wide search."
-            : null,
-        );
       }
       setLoading(false);
     })();
@@ -276,173 +827,155 @@ export default function SearchPage() {
     : "";
 
   return (
-    <>
-      <main className="mx-auto w-full max-w-3xl flex-1 px-4 pb-28 pt-6 md:pb-12">
-        <header className="flex flex-col gap-3">
-          <Link
-            href="/"
-            className="inline-flex items-center gap-2 text-sm text-zinc-600 hover:text-foreground dark:text-zinc-400"
-          >
-            <ArrowLeft className="h-4 w-4" aria-hidden />
-            Home
-          </Link>
-          <h1 className="flex items-center gap-2 text-2xl font-semibold tracking-tight">
-            <Search className="h-6 w-6 text-teal-600" aria-hidden />
-            Search
-          </h1>
-        </header>
+    <section className="mt-5">
+      <p className="text-sm text-zinc-600 dark:text-zinc-400">
+        Search through products you have scanned before.
+      </p>
 
-        {/* Search bar */}
-        <div className="relative mt-4">
-          <Search
-            className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-zinc-400"
-            aria-hidden
-          />
-          <input
-            type="search"
-            value={query}
-            onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") setDebounced(query);
+      {/* Search bar */}
+      <div className="relative mt-3">
+        <Search
+          className="pointer-events-none absolute left-3.5 top-1/2 h-5 w-5 -translate-y-1/2 text-zinc-400"
+          aria-hidden
+        />
+        <input
+          type="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") setDebounced(query);
+          }}
+          placeholder="Search your scans..."
+          className="w-full rounded-2xl border border-zinc-300 bg-transparent py-3 pl-11 pr-10 text-sm text-foreground placeholder:text-zinc-400 focus:border-teal-500 focus:outline-none focus:ring-1 focus:ring-teal-500 dark:border-white/15"
+        />
+        {query && (
+          <button
+            type="button"
+            aria-label="Clear search"
+            onClick={() => {
+              setQuery("");
+              setDebounced("");
             }}
-            placeholder="Search for a product or ingredient..."
-            className="w-full rounded-2xl border border-zinc-300 bg-transparent py-3 pl-11 pr-10 text-sm text-foreground placeholder:text-zinc-400 focus:border-teal-500 focus:outline-none focus:ring-1 focus:ring-teal-500 dark:border-white/15"
-          />
-          {query && (
-            <button
-              type="button"
-              aria-label="Clear search"
-              onClick={() => {
-                setQuery("");
-                setDebounced("");
-              }}
-              className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded-full p-1 text-zinc-400 hover:text-foreground"
-            >
-              <X className="h-4 w-4" aria-hidden />
-            </button>
+            className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded-full p-1 text-zinc-400 hover:text-foreground"
+          >
+            <X className="h-4 w-4" aria-hidden />
+          </button>
+        )}
+      </div>
+
+      {/* ---------- BROWSE ---------- */}
+      {mode === "browse" && (
+        <div className="mt-6">
+          <h2 className="text-sm font-semibold">Browse by Category</h2>
+          <div className="mt-3 grid grid-cols-3 gap-3 sm:grid-cols-4 lg:grid-cols-5">
+            {PRODUCT_CATEGORIES.map((c) => (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() => selectCategory(c.id)}
+                className="flex flex-col items-center gap-1 rounded-2xl border border-zinc-200 p-3 text-center transition-colors hover:border-teal-300 hover:bg-teal-50/50 dark:border-white/10 dark:hover:border-teal-500/40 dark:hover:bg-teal-500/[0.06]"
+              >
+                <span className="text-2xl" aria-hidden>
+                  {c.icon_emoji}
+                </span>
+                <span className="text-xs font-medium leading-tight">
+                  {c.name}
+                </span>
+                <span className="text-[10px] text-zinc-500">
+                  {catCounts[c.id] ?? 0} scanned
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ---------- CATEGORY / SEARCH ---------- */}
+      {mode !== "browse" && (
+        <div className="mt-5 flex flex-col gap-4">
+          <div className="flex items-center justify-between gap-3">
+            {mode === "category" ? (
+              <button
+                type="button"
+                onClick={() => setActiveCategory(null)}
+                className="inline-flex items-center gap-1 text-sm font-medium text-teal-700 dark:text-teal-300"
+              >
+                <ChevronLeft className="h-4 w-4" aria-hidden />
+                All categories
+              </button>
+            ) : (
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                Results for{" "}
+                <span className="font-semibold text-foreground">
+                  &ldquo;{term}&rdquo;
+                </span>
+              </p>
+            )}
+            <SortTabs value={sort} onChange={setSort} />
+          </div>
+
+          {mode === "category" && (
+            <h2 className="text-lg font-semibold">
+              {CATEGORY_MAP.get(activeCategory ?? "")?.icon_emoji}{" "}
+              {activeCatName}
+            </h2>
+          )}
+
+          {loading && (
+            <ul className="flex flex-col gap-2">
+              {Array.from({ length: 4 }).map((_, i) => (
+                <ResultRowSkeleton key={i} />
+              ))}
+            </ul>
+          )}
+
+          {error && !loading && (
+            <div className="flex flex-col items-start gap-3 rounded-2xl border border-red-500/30 bg-red-500/[0.06] p-4 text-sm text-red-700 dark:text-red-300">
+              <p>{error}</p>
+              <button
+                type="button"
+                onClick={() => setReloadKey((k) => k + 1)}
+                className="inline-flex items-center gap-2 rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white"
+              >
+                <RefreshCw className="h-4 w-4" aria-hidden />
+                Try again
+              </button>
+            </div>
+          )}
+
+          {!loading && !error && sorted.length === 0 && (
+            <MyScansNoResults term={mode === "search" ? term : activeCatName} />
+          )}
+
+          {/* Safest highlight (category mode only) */}
+          {!loading && mode === "category" && safest.length > 0 && (
+            <div className="rounded-2xl border border-green-500/30 bg-green-500/[0.05] p-4">
+              <h3 className="text-sm font-semibold text-green-700 dark:text-green-300">
+                🌟 Safest in {activeCatName}
+              </h3>
+              <ul className="mt-3 flex flex-col gap-2">
+                {safest.map((g) => (
+                  <ResultCard key={g.key} group={g} highlightSafe />
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {!loading && sorted.length > 0 && (
+            <ul className="flex flex-col gap-2">
+              {sorted.map((g) => (
+                <ResultCard key={g.key} group={g} />
+              ))}
+            </ul>
           )}
         </div>
-
-        {scopeNote && mode !== "browse" && (
-          <p className="mt-2 rounded-lg bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-            {scopeNote}
-          </p>
-        )}
-
-        {/* ---------- BROWSE ---------- */}
-        {mode === "browse" && (
-          <section className="mt-6">
-            <h2 className="text-sm font-semibold">Browse by Category</h2>
-            <div className="mt-3 grid grid-cols-3 gap-3 sm:grid-cols-4 lg:grid-cols-5">
-              {PRODUCT_CATEGORIES.map((c) => (
-                <button
-                  key={c.id}
-                  type="button"
-                  onClick={() => selectCategory(c.id)}
-                  className="flex flex-col items-center gap-1 rounded-2xl border border-zinc-200 p-3 text-center transition-colors hover:border-teal-300 hover:bg-teal-50/50 dark:border-white/10 dark:hover:border-teal-500/40 dark:hover:bg-teal-500/[0.06]"
-                >
-                  <span className="text-2xl" aria-hidden>
-                    {c.icon_emoji}
-                  </span>
-                  <span className="text-xs font-medium leading-tight">
-                    {c.name}
-                  </span>
-                  <span className="text-[10px] text-zinc-500">
-                    {catCounts[c.id] ?? 0} scanned
-                  </span>
-                </button>
-              ))}
-            </div>
-          </section>
-        )}
-
-        {/* ---------- CATEGORY / SEARCH ---------- */}
-        {mode !== "browse" && (
-          <section className="mt-5 flex flex-col gap-4">
-            <div className="flex items-center justify-between gap-3">
-              {mode === "category" ? (
-                <button
-                  type="button"
-                  onClick={() => setActiveCategory(null)}
-                  className="inline-flex items-center gap-1 text-sm font-medium text-teal-700 dark:text-teal-300"
-                >
-                  <ChevronLeft className="h-4 w-4" aria-hidden />
-                  All categories
-                </button>
-              ) : (
-                <p className="text-sm text-zinc-600 dark:text-zinc-400">
-                  Results for{" "}
-                  <span className="font-semibold text-foreground">
-                    &ldquo;{term}&rdquo;
-                  </span>
-                </p>
-              )}
-              <SortTabs value={sort} onChange={setSort} />
-            </div>
-
-            {mode === "category" && (
-              <h2 className="text-lg font-semibold">
-                {CATEGORY_MAP.get(activeCategory ?? "")?.icon_emoji}{" "}
-                {activeCatName}
-              </h2>
-            )}
-
-            {loading && (
-              <ul className="flex flex-col gap-2">
-                {Array.from({ length: 4 }).map((_, i) => (
-                  <ResultRowSkeleton key={i} />
-                ))}
-              </ul>
-            )}
-
-            {error && !loading && (
-              <div className="flex flex-col items-start gap-3 rounded-2xl border border-red-500/30 bg-red-500/[0.06] p-4 text-sm text-red-700 dark:text-red-300">
-                <p>{error}</p>
-                <button
-                  type="button"
-                  onClick={() => setReloadKey((k) => k + 1)}
-                  className="inline-flex items-center gap-2 rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white"
-                >
-                  <RefreshCw className="h-4 w-4" aria-hidden />
-                  Try again
-                </button>
-              </div>
-            )}
-
-            {!loading && !error && sorted.length === 0 && (
-              <NoResults term={mode === "search" ? term : activeCatName} />
-            )}
-
-            {/* Safest highlight (category mode only) */}
-            {!loading && mode === "category" && safest.length > 0 && (
-              <div className="rounded-2xl border border-green-500/30 bg-green-500/[0.05] p-4">
-                <h3 className="text-sm font-semibold text-green-700 dark:text-green-300">
-                  🌟 Safest in {activeCatName}
-                </h3>
-                <ul className="mt-3 flex flex-col gap-2">
-                  {safest.map((g) => (
-                    <ResultCard key={g.key} group={g} highlightSafe />
-                  ))}
-                </ul>
-              </div>
-            )}
-
-            {!loading && sorted.length > 0 && (
-              <ul className="flex flex-col gap-2">
-                {sorted.map((g) => (
-                  <ResultCard key={g.key} group={g} />
-                ))}
-              </ul>
-            )}
-          </section>
-        )}
-      </main>
-    </>
+      )}
+    </section>
   );
 }
 
 // ---------------------------------------------------------------------------
-// Pieces
+// My-scans pieces
 // ---------------------------------------------------------------------------
 
 function SortTabs({
@@ -557,17 +1090,17 @@ function ResultCard({
   );
 }
 
-function NoResults({ term }: { term: string }) {
+function MyScansNoResults({ term }: { term: string }) {
   return (
     <div className="flex flex-col items-center gap-3 rounded-2xl border border-zinc-200 p-8 text-center dark:border-white/10">
       <span className="flex h-16 w-16 items-center justify-center rounded-full bg-teal-600/10 text-teal-600 dark:text-teal-400">
-        <Search className="h-8 w-8" aria-hidden />
+        <FlaskConical className="h-8 w-8" aria-hidden />
       </span>
       <p className="text-sm font-semibold">
-        No products found{term ? ` for “${term}”` : ""}
+        No scans found{term ? ` for “${term}”` : ""}
       </p>
       <p className="text-sm text-zinc-600 dark:text-zinc-400">
-        Be the first to scan this product!
+        Scan this product to add it to your history.
       </p>
       <Link
         href="/scan"

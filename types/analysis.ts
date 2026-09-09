@@ -32,6 +32,29 @@ export interface PersonalFlag {
   ingredient?: string | null;
 }
 
+/**
+ * Broad regulatory category the analyzer detects from the packaging text
+ * (PHASE 1 of the analysis). Each maps to a different law + regulator, and the
+ * ingredient rules applied in PHASE 2 depend on it.
+ */
+export type DetectedCategoryId =
+  | "food_and_beverages"
+  | "personal_care"
+  | "household_cleaning"
+  | "baby_product_food"
+  | "baby_product_care"
+  | "unknown";
+
+export interface DetectedCategory {
+  category: DetectedCategoryId;
+  confidence: "high" | "medium" | "low";
+  /** The text signals that identified the category (for transparency + the "is this right?" prompt). */
+  signals_found: string[];
+  regulatory_body: string;
+  applicable_act: string;
+  complaint_portal: string;
+}
+
 export interface ProductInfo {
   name: string | null;
   brand: string | null;
@@ -47,11 +70,26 @@ export interface ProductInfo {
   country_of_origin: string | null;
 }
 
+/**
+ * State of one mandatory declaration.
+ * - present:        visible on the label
+ * - missing:        label is legible and the declaration is genuinely absent
+ * - not_visible:    could not tell — only part of the pack was photographed
+ * - not_applicable: does not apply to this product category
+ */
+export type ComplianceItemStatus =
+  | "present"
+  | "missing"
+  | "not_visible"
+  | "not_applicable";
+
 export interface ComplianceItem {
   present: boolean;
   value: string | null;
   compliant: boolean;
   issue: string | null;
+  /** Optional richer state; older stored rows may not have it. */
+  status?: ComplianceItemStatus;
 }
 
 /**
@@ -93,9 +131,21 @@ export interface DatabaseGapEntry {
   suggested_status: SafetyStatus;
 }
 
+/**
+ * 'ok'                — a real score was produced.
+ * 'insufficient_data' — the scan couldn't read enough to score honestly
+ *                       (no ingredients found, or >3 declarations not visible).
+ *                       The matching score is then null.
+ */
+export type AssessmentStatus = "ok" | "insufficient_data";
+
 export interface OverallAssessment {
-  safety_score: number;
-  compliance_score: number;
+  /** null when safety_status is 'insufficient_data'. */
+  safety_score: number | null;
+  /** null when compliance_status is 'insufficient_data'. */
+  compliance_score: number | null;
+  safety_status?: AssessmentStatus;
+  compliance_status?: AssessmentStatus;
   summary: string;
   recommendation: string;
 }
@@ -105,6 +155,14 @@ export interface BannedIngredientCheck {
   detected: boolean;
   notes: string | null;
 }
+
+/**
+ * Top-line call the results screen leads with.
+ * - safe:    "Safe to consume"
+ * - caution: "Consume with caution"
+ * - avoid:   "Avoid this product"
+ */
+export type Verdict = "safe" | "caution" | "avoid";
 
 /** Overall additive load, based on how many additives are present and how concerning they are. */
 export type CumulativeRisk = "low" | "medium" | "high";
@@ -147,6 +205,14 @@ export interface DosageAnalysis {
 
 export interface ProductAnalysis {
   product_info: ProductInfo;
+  /** Broad regulatory category (food / personal care / household / baby) + which rules were applied. */
+  detected_category: DetectedCategory;
+  /** Top-line call the results screen leads with. */
+  verdict: Verdict;
+  /** One sentence backing the verdict, <= 20 words. */
+  verdict_reason: string;
+  /** 2-4 short headline findings, each under ~12 words. */
+  key_findings: string[];
   legal_metrology_compliance: LegalMetrologyCompliance;
   ingredient_analysis: IngredientAnalysis[];
   dosage_analysis: DosageAnalysis;
@@ -173,4 +239,9 @@ export interface AnalyzeRequestBody {
   extractedText: string;
   imageUrl?: string;
   userHealthProfile?: UserHealthProfileInput | null;
+  /**
+   * Set when the user rejected the auto-detected category and picked the right
+   * one. The analysis is then re-run under that category's rules.
+   */
+  categoryOverride?: DetectedCategoryId | null;
 }

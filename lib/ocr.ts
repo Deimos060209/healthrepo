@@ -111,13 +111,23 @@ export async function processImage(
 
   const TesseractRT = (await import("tesseract.js")).default;
 
+  // Preprocess: EXIF-orient, keep the long edge >= 1600px (small print needs
+  // resolution), greyscale + contrast-stretch. Packet photos are very often
+  // rotated, so when `base` is a canvas we also OCR at 90/180/270 and keep the
+  // strongest read. Falls back to the raw file if canvas is unavailable.
+  const base = await preprocessForOcr(imageFile);
+  const angles: RotationAngle[] = base ? [0, 90, 180, 270] : [0];
+
+  let passIndex = 0;
+  const passCount = angles.length;
+
   let worker: Tesseract.Worker | undefined;
   try {
     worker = await TesseractRT.createWorker(language, 1, {
       logger: (m: Tesseract.LoggerMessage) => {
         if (signal?.aborted) return;
         if (m.status === "recognizing text") {
-          onProgress?.(m.progress, "recognizing");
+          onProgress?.((passIndex + m.progress) / passCount, "recognizing");
         } else if (onProgress) {
           // model download / init phases — keep the bar moving but capped low
           onProgress(Math.min(Math.max(m.progress, 0), 1) * 0.15, "loading");
@@ -135,44 +145,94 @@ export async function processImage(
   try {
     assertNotAborted(signal, worker);
 
-    let page: Tesseract.Page;
-    try {
-      const { data } = await worker.recognize(
-        imageFile,
-        undefined,
-        { text: true, blocks: true },
-      );
-      page = data;
-    } catch (cause) {
-      // Tesseract surfaces undecodable input as a generic error here.
-      throw new OcrError(
-        "DECODE_FAILED",
-        "That image could not be read. Try a different photo, or a JPG / PNG file.",
-        { cause },
-      );
+    let best:
+      | {
+          page: Tesseract.Page;
+          text: string;
+          confidence: number;
+          wordCount: number;
+          strength: number;
+          angle: RotationAngle;
+        }
+      | null = null;
+
+    for (let i = 0; i < angles.length; i++) {
+      const angle = angles[i];
+      passIndex = i;
+      assertNotAborted(signal, worker);
+
+      const input: Tesseract.ImageLike =
+        angle === 0
+          ? ((base ?? imageFile) as Tesseract.ImageLike)
+          : (rotateCanvas(base as HTMLCanvasElement, angle) as Tesseract.ImageLike);
+
+      let page: Tesseract.Page;
+      try {
+        const { data } = await worker.recognize(input, undefined, {
+          text: true,
+          blocks: true,
+        });
+        page = data;
+      } catch (cause) {
+        // A decode failure on the very first pass means the image itself is bad.
+        if (i === 0 && !best) {
+          throw new OcrError(
+            "DECODE_FAILED",
+            "That image could not be read. Try a different photo, or a JPG / PNG file.",
+            { cause },
+          );
+        }
+        continue;
+      }
+
+      const text = normalizeText(page.text ?? "");
+      const confidence = Math.round(page.confidence ?? 0);
+      const wordCount = countWords(text);
+      const strength = passStrength(confidence, wordCount, text);
+
+      if (!best || strength > best.strength) {
+        best = { page, text, confidence, wordCount, strength, angle };
+      }
+
+      // A confident, label-shaped upright read — no need to spin the image.
+      if (
+        angle === 0 &&
+        confidence >= 65 &&
+        wordCount >= 15 &&
+        validateExtractedText(text).score >= 3
+      ) {
+        break;
+      }
     }
 
     assertNotAborted(signal, worker);
     onProgress?.(1, "done");
 
-    const text = normalizeText(page.text ?? "");
-    const confidence = Math.round(page.confidence ?? 0);
-    const words = flattenWords(page);
-    const wordCount = countWords(text);
-
-    if (!text) {
+    if (!best || !best.text) {
       throw new OcrError(
         "NO_TEXT_FOUND",
         "No text was found on this image. Make sure the label fills the frame and is in focus.",
       );
     }
 
+    const { page, text, confidence, wordCount, angle } = best;
+    const words = flattenWords(page);
     const lowConfidence = minConfidence > 0 && confidence < minConfidence;
     if (lowConfidence && text.length < MIN_USABLE_TEXT_LENGTH) {
       throw new OcrError(
         "LOW_CONFIDENCE",
         "The image looks too blurry to read. Hold steady, move closer, and retake the photo in good light.",
       );
+    }
+
+    if (typeof console !== "undefined") {
+      console.info("[ocr] tesseract:", {
+        angle,
+        confidence,
+        wordCount,
+        validationScore: validateExtractedText(text).score,
+        chars: text.length,
+      });
     }
 
     return { text, confidence, wordCount, words, lowConfidence };
@@ -185,6 +245,121 @@ export async function processImage(
     // Always release the worker; ignore teardown errors.
     await worker?.terminate().catch(() => {});
   }
+}
+
+type RotationAngle = 0 | 90 | 180 | 270;
+
+/** Longest edge OCR is allowed to shrink a photo to. Never goes below ~1600. */
+const OCR_MAX_LONG_EDGE = 2400;
+
+/**
+ * Decode, EXIF-orient, keep resolution, greyscale + contrast-stretch. Returns a
+ * canvas ready for OCR (and for rotation trials), or null when the browser
+ * cannot give us one — the caller then OCRs the raw file at 0° only.
+ */
+async function preprocessForOcr(file: File): Promise<HTMLCanvasElement | null> {
+  if (
+    typeof document === "undefined" ||
+    typeof createImageBitmap === "undefined"
+  ) {
+    return null;
+  }
+  try {
+    const bitmap = await createImageBitmap(file, {
+      imageOrientation: "from-image",
+    });
+    try {
+      const longEdge = Math.max(bitmap.width, bitmap.height);
+      // Only cap the very large photos — never shrink below the source or 1600.
+      const scale =
+        longEdge > OCR_MAX_LONG_EDGE ? OCR_MAX_LONG_EDGE / longEdge : 1;
+      const w = Math.max(1, Math.round(bitmap.width * scale));
+      const h = Math.max(1, Math.round(bitmap.height * scale));
+
+      const canvas = document.createElement("canvas");
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return null;
+      ctx.drawImage(bitmap, 0, 0, w, h);
+
+      try {
+        const img = ctx.getImageData(0, 0, w, h);
+        greyscaleContrast(img.data);
+        ctx.putImageData(img, 0, 0);
+      } catch {
+        // getImageData can fail on huge canvases / tight memory — the correctly
+        // oriented, un-enhanced canvas is still worth using.
+      }
+      return canvas;
+    } finally {
+      bitmap.close?.();
+    }
+  } catch {
+    return null;
+  }
+}
+
+/** In-place greyscale then a 2nd–98th percentile contrast stretch. */
+function greyscaleContrast(d: Uint8ClampedArray): void {
+  for (let i = 0; i < d.length; i += 4) {
+    const y = d[i] * 0.299 + d[i + 1] * 0.587 + d[i + 2] * 0.114;
+    d[i] = d[i + 1] = d[i + 2] = y;
+  }
+  const hist = new Uint32Array(256);
+  for (let i = 0; i < d.length; i += 4) hist[Math.min(255, d[i] | 0)]++;
+  const total = d.length / 4;
+  const lo = histPercentile(hist, total, 0.02);
+  const hi = histPercentile(hist, total, 0.98);
+  const range = Math.max(1, hi - lo);
+  for (let i = 0; i < d.length; i += 4) {
+    const v = Math.max(0, Math.min(255, ((d[i] - lo) / range) * 255));
+    d[i] = d[i + 1] = d[i + 2] = v;
+  }
+}
+
+function histPercentile(hist: Uint32Array, total: number, p: number): number {
+  const target = total * p;
+  let cum = 0;
+  for (let v = 0; v < 256; v++) {
+    cum += hist[v];
+    if (cum >= target) return v;
+  }
+  return 255;
+}
+
+/** Rotate a canvas by a quarter turn into a fresh canvas. */
+function rotateCanvas(
+  src: HTMLCanvasElement,
+  angle: 90 | 180 | 270,
+): HTMLCanvasElement {
+  const c = document.createElement("canvas");
+  const quarter = angle === 90 || angle === 270;
+  c.width = quarter ? src.height : src.width;
+  c.height = quarter ? src.width : src.height;
+  const ctx = c.getContext("2d");
+  if (!ctx) return src;
+  ctx.translate(c.width / 2, c.height / 2);
+  ctx.rotate((angle * Math.PI) / 180);
+  ctx.drawImage(src, -src.width / 2, -src.height / 2);
+  return c;
+}
+
+/**
+ * How "good" one OCR pass looks: raw confidence, plus word count (capped) and
+ * how label-shaped the text is. Rotated-wrong reads score low on all three, so
+ * this reliably picks the upright orientation.
+ */
+function passStrength(
+  confidence: number,
+  wordCount: number,
+  text: string,
+): number {
+  return (
+    confidence +
+    Math.min(wordCount, 80) * 0.6 +
+    validateExtractedText(text).score * 6
+  );
 }
 
 /** Count whitespace-separated tokens in a string. */
@@ -265,9 +440,11 @@ export function validateExtractedText(text: string): TextValidation {
 // Vision fallback payload
 // ---------------------------------------------------------------------------
 
-/** Long-edge cap for the Vision fallback image (Anthropic downsizes anyway). */
-const VISION_MAX_EDGE = 1600;
-const VISION_JPEG_QUALITY = 0.8;
+/** Anthropic's optimal long edge — larger costs tokens with no accuracy gain. */
+const VISION_TARGET_EDGE = 1568;
+const VISION_JPEG_QUALITY = 0.85;
+/** Anthropic rejects a single image over ~5 MB; keep the base64 comfortably under. */
+const VISION_MAX_BYTES = 5 * 1024 * 1024;
 
 export interface VisionImagePayload {
   /** Bare base64 (no `data:` prefix). */
@@ -276,10 +453,18 @@ export interface VisionImagePayload {
   mediaType: string;
 }
 
+/** Decoded byte length of a base64 string / data URL. */
+function base64Bytes(s: string): number {
+  const b64 = s.includes(",") ? s.slice(s.indexOf(",") + 1) : s;
+  const padding = b64.endsWith("==") ? 2 : b64.endsWith("=") ? 1 : 0;
+  return Math.max(0, Math.floor((b64.length * 3) / 4) - padding);
+}
+
 /**
- * Convert a picked File into a base64 payload for the Haiku Vision fallback.
- * Downscales + re-encodes as JPEG where the browser supports it; otherwise
- * sends the original bytes unchanged.
+ * Convert a picked File into a base64 payload for the Vision fallbacks:
+ * EXIF-orient, resize the long edge to 1568px, re-encode JPEG q0.85, and step
+ * quality down if the payload would exceed the 5 MB image cap. Falls back to the
+ * raw bytes only when canvas is unavailable.
  */
 export async function imageToVisionPayload(
   file: File,
@@ -291,7 +476,7 @@ export async function imageToVisionPayload(
     try {
       const scale = Math.min(
         1,
-        VISION_MAX_EDGE / Math.max(bitmap.width, bitmap.height),
+        VISION_TARGET_EDGE / Math.max(bitmap.width, bitmap.height),
       );
       const w = Math.max(1, Math.round(bitmap.width * scale));
       const h = Math.max(1, Math.round(bitmap.height * scale));
@@ -303,13 +488,34 @@ export async function imageToVisionPayload(
       if (!ctx) throw new Error("Canvas 2D context unavailable.");
       ctx.drawImage(bitmap, 0, 0, w, h);
 
-      const dataUrl = canvas.toDataURL("image/jpeg", VISION_JPEG_QUALITY);
-      return { base64: dataUrl.split(",")[1] ?? "", mediaType: "image/jpeg" };
+      let quality = VISION_JPEG_QUALITY;
+      let dataUrl = canvas.toDataURL("image/jpeg", quality);
+      while (base64Bytes(dataUrl) > VISION_MAX_BYTES && quality > 0.4) {
+        quality = Math.round((quality - 0.15) * 100) / 100;
+        dataUrl = canvas.toDataURL("image/jpeg", quality);
+      }
+
+      const base64 = dataUrl.split(",")[1] ?? "";
+      if (typeof console !== "undefined") {
+        console.info("[ocr] vision payload:", {
+          size: `${w}x${h}`,
+          quality,
+          kb: Math.round(base64Bytes(dataUrl) / 1024),
+        });
+      }
+      return { base64, mediaType: "image/jpeg" };
     } finally {
       bitmap.close?.();
     }
   } catch {
-    return readFileAsBase64(file);
+    const raw = await readFileAsBase64(file);
+    if (typeof console !== "undefined") {
+      console.warn("[ocr] vision payload: canvas unavailable, sending raw file", {
+        type: raw.mediaType,
+        kb: Math.round(base64Bytes(raw.base64) / 1024),
+      });
+    }
+    return raw;
   }
 }
 

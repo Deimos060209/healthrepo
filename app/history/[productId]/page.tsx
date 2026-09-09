@@ -23,13 +23,19 @@ import { useToast } from "@/components/ToastProvider";
 import { supabase } from "@/lib/supabase";
 import { removeProductImage } from "@/lib/storage";
 import { HEALTHIER_ALTERNATIVES } from "@/lib/reference-data";
-import { normalizeDosageAnalysis } from "@/lib/analysis-normalize";
+import {
+  normalizeDosageAnalysis,
+  normalizeDetectedCategory,
+  normalizeVerdict,
+} from "@/lib/analysis-normalize";
+import { resolveCategory } from "@/lib/product-category";
 import type {
   ProductAnalysis,
   IngredientAnalysis,
   ComplianceItem,
   SafetyStatus,
   DosageAnalysis,
+  DetectedCategory,
   PersonalFlag,
 } from "@/types/analysis";
 import type { StoredAlternative } from "@/types/database";
@@ -43,6 +49,7 @@ interface ScanRow {
   product_name: string;
   brand: string | null;
   category: string | null;
+  detected_category: DetectedCategory | null;
   image_url: string | null;
   compliance_status: "compliant" | "non_compliant" | "partial" | null;
   compliance_details: Record<string, ComplianceItem> | null;
@@ -170,6 +177,9 @@ function deriveAlternatives(row: ScanRow): StoredAlternative[] {
 
 function rowToAnalysis(row: ScanRow): ProductAnalysis {
   const cd = row.compliance_details ?? {};
+  const ing = row.ingredient_analysis ?? [];
+  const bannedN = ing.filter((i) => i.safety_status === "banned").length;
+  const harmfulN = ing.filter((i) => i.safety_status === "harmful").length;
   return {
     product_info: {
       name: row.product_name ?? null,
@@ -185,6 +195,10 @@ function rowToAnalysis(row: ScanRow): ProductAnalysis {
       customer_care: cd.consumer_care?.value ?? null,
       country_of_origin: cd.country_of_origin?.value ?? null,
     },
+    detected_category: normalizeDetectedCategory(row.detected_category),
+    verdict: normalizeVerdict(null, row.overall_score ?? null, bannedN, harmfulN),
+    verdict_reason: "",
+    key_findings: [],
     legal_metrology_compliance: cd,
     ingredient_analysis: (row.ingredient_analysis ?? []).map((ing) => ({
       ...ing,
@@ -240,7 +254,7 @@ export default function HistoryDetailPage({
       const { data, error } = await supabase
         .from("scanned_products")
         .select(
-          "id, product_name, brand, category, image_url, compliance_status, compliance_details, ingredient_analysis, dosage_analysis, personal_alerts, healthier_alternatives, overall_score, scanned_at",
+          "id, product_name, brand, category, detected_category, image_url, compliance_status, compliance_details, ingredient_analysis, dosage_analysis, personal_alerts, healthier_alternatives, overall_score, scanned_at",
         )
         .eq("id", productId)
         .eq("user_id", user.id)
@@ -390,6 +404,22 @@ export default function HistoryDetailPage({
               {titleCase(row.category)}
             </span>
           )}
+          {row.detected_category && (() => {
+            const meta = resolveCategory(row.detected_category);
+            return (
+              <div className="mt-2 flex flex-col items-center gap-1">
+                <span
+                  className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold ${meta.badgeClass}`}
+                >
+                  <span aria-hidden>{meta.emoji}</span>
+                  {meta.label}
+                </span>
+                <p className="text-[11px] text-zinc-500">
+                  Regulated by {meta.regulatoryBody}
+                </p>
+              </div>
+            );
+          })()}
         </div>
         {row.image_url && !imageFailed && (
           // eslint-disable-next-line @next/next/no-img-element

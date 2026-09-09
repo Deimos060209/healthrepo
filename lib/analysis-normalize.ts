@@ -23,6 +23,9 @@ import type {
   LimitCheckStatus,
   PersonalFlag,
   PersonalFlagSeverity,
+  DetectedCategory,
+  DetectedCategoryId,
+  ComplianceItemStatus,
 } from "@/types/analysis";
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -44,9 +47,58 @@ const strList = (v: unknown): string[] => {
   return s.split(",").map((p) => p.trim()).filter(Boolean);
 };
 
-const score = (v: unknown): number => {
-  const n = typeof v === "number" ? v : Number(str(v) ?? NaN);
-  return Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : 0;
+/**
+ * Returns null when the model explicitly declined to score
+ * (safety_score: null / "insufficient_data") rather than inventing a 0.
+ */
+const clampScore = (n: number): number | null =>
+  Number.isFinite(n) ? Math.max(0, Math.min(100, Math.round(n))) : null;
+
+const scoreOrNull = (v: unknown): number | null => {
+  if (v === null || v === undefined) return null;
+  // A number is the normal case — take it directly. (Testing the string
+  // sentinels against a coerced "" here used to null EVERY numeric score.)
+  if (typeof v === "number") return clampScore(v);
+  if (typeof v !== "string") return null;
+  const s = v.trim().toLowerCase();
+  if (
+    s === "" ||
+    s === "null" ||
+    s === "n/a" ||
+    s === "na" ||
+    s === "unknown" ||
+    s.includes("insufficient")
+  ) {
+    return null;
+  }
+  return clampScore(Number(s));
+};
+
+const COMPLIANCE_ITEM_STATUSES: readonly string[] = [
+  "present",
+  "missing",
+  "not_visible",
+  "not_applicable",
+];
+/** Resolve a compliance item's state, honouring an explicit model `status`. */
+const complianceItemStatus = (
+  raw: unknown,
+  present: boolean,
+  issue: string | null,
+): ComplianceItemStatus => {
+  const s = String(raw ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/[\s-]+/g, "_");
+  if (COMPLIANCE_ITEM_STATUSES.includes(s)) return s as ComplianceItemStatus;
+  if (s.includes("not_visible") || s.includes("unclear") || s.includes("cannot_tell"))
+    return "not_visible";
+  if (s.includes("not_applicable") || s === "na") return "not_applicable";
+  if (s.includes("present") || s.includes("found")) return "present";
+  if (s.includes("missing") || s.includes("absent")) return "missing";
+  // No usable status from the model — fall back to the old present/issue shape.
+  if (!present && /not applicable/i.test(issue ?? "")) return "not_applicable";
+  return present ? "present" : "missing";
 };
 
 const SAFETY_STATUSES: readonly string[] = [
@@ -121,6 +173,50 @@ const limitStatus = (v: unknown): LimitCheckStatus => {
   return "quantity_not_declared";
 };
 
+const DETECTED_CATEGORY_IDS: readonly string[] = [
+  "food_and_beverages",
+  "personal_care",
+  "household_cleaning",
+  "baby_product_food",
+  "baby_product_care",
+  "unknown",
+];
+const detectedCategoryId = (v: unknown): DetectedCategoryId => {
+  const s = String(v ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/[\s-]+/g, "_");
+  if (DETECTED_CATEGORY_IDS.includes(s)) return s as DetectedCategoryId;
+  // Tolerate near-misses from the model.
+  if (s.includes("baby") && (s.includes("care") || s.includes("cosmetic")))
+    return "baby_product_care";
+  if (s.includes("baby") || s.includes("infant")) return "baby_product_food";
+  if (s.includes("household") || s.includes("cleaning") || s.includes("cleaner"))
+    return "household_cleaning";
+  if (s.includes("personal") || s.includes("cosmetic") || s.includes("care"))
+    return "personal_care";
+  if (s.includes("food") || s.includes("beverage") || s.includes("drink"))
+    return "food_and_beverages";
+  return "unknown";
+};
+
+const CONFIDENCE_LEVELS: readonly string[] = ["high", "medium", "low"];
+
+export function normalizeDetectedCategory(raw: unknown): DetectedCategory {
+  const d = isObj(raw) ? raw : {};
+  const conf = String(d.confidence ?? "").toLowerCase().trim();
+  return {
+    category: detectedCategoryId(d.category ?? d.detected_category),
+    confidence: CONFIDENCE_LEVELS.includes(conf)
+      ? (conf as DetectedCategory["confidence"])
+      : "low",
+    signals_found: sentenceList(d.signals_found),
+    regulatory_body: str(d.regulatory_body) ?? "",
+    applicable_act: str(d.applicable_act ?? d.act) ?? "",
+    complaint_portal: str(d.complaint_portal) ?? "",
+  };
+}
+
 export function normalizeDosageAnalysis(raw: unknown): DosageAnalysis {
   const d = isObj(raw) ? raw : {};
   const ac = isObj(d.additive_count) ? d.additive_count : {};
@@ -194,13 +290,23 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
     : {};
   for (const [key, v] of Object.entries(lmc)) {
     if (!isObj(v)) continue; // drop nulls / stray strings rather than render them
+    const issue = str(v.issue);
+    const present = v.present === true;
     legal_metrology_compliance[key] = {
-      present: v.present === true,
+      present,
       value: str(v.value),
       compliant: v.compliant === true,
-      issue: str(v.issue),
+      issue,
+      status: complianceItemStatus(v.status, present, issue),
     };
   }
+
+  // "Not visible" declarations mean the photo only caught part of the pack.
+  // Past a handful of them a compliance verdict is dishonest — the route/prompt
+  // is told to null the score, and this enforces it even if the model forgot.
+  const notVisibleCount = Object.values(legal_metrology_compliance).filter(
+    (c) => c.status === "not_visible",
+  ).length;
 
   const ingredient_analysis: IngredientAnalysis[] = (
     Array.isArray(r.ingredient_analysis) ? r.ingredient_analysis : []
@@ -220,12 +326,47 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
     }));
 
   const oa = isObj(r.overall_assessment) ? r.overall_assessment : {};
+  const rawSafety = scoreOrNull(oa.safety_score);
+  const rawCompliance = scoreOrNull(oa.compliance_score);
+  // Force "insufficient" when the model said so, when it returned no score, when
+  // it found no ingredients (cannot score safety), or when too much of the
+  // label was unreadable (cannot score compliance).
+  const safetyInsufficient =
+    rawSafety === null ||
+    /insufficient/i.test(String(oa.safety_status ?? "")) ||
+    ingredient_analysis.length === 0;
+  const complianceInsufficient =
+    rawCompliance === null ||
+    /insufficient/i.test(String(oa.compliance_status ?? "")) ||
+    notVisibleCount > 3;
+
   const overall_assessment: OverallAssessment = {
-    safety_score: score(oa.safety_score),
-    compliance_score: score(oa.compliance_score),
+    safety_score: safetyInsufficient ? null : rawSafety,
+    compliance_score: complianceInsufficient ? null : rawCompliance,
+    safety_status: safetyInsufficient ? "insufficient_data" : "ok",
+    compliance_status: complianceInsufficient ? "insufficient_data" : "ok",
     summary: str(oa.summary) ?? "",
     recommendation: str(oa.recommendation) ?? "",
   };
+
+  // ---- Top-line verdict + headline findings (FIX 2) ----
+  const bannedCount = ingredient_analysis.filter(
+    (i) => i.safety_status === "banned",
+  ).length;
+  const harmfulCount = ingredient_analysis.filter(
+    (i) => i.safety_status === "harmful",
+  ).length;
+  const verdict = normalizeVerdict(
+    r.verdict,
+    overall_assessment.safety_score,
+    bannedCount,
+    harmfulCount,
+  );
+  const verdict_reason = str(r.verdict_reason) ?? "";
+  const key_findings = sentenceList(r.key_findings)
+    .map((s) => s.replace(/\s+/g, " ").trim())
+    .filter(Boolean)
+    .slice(0, 4);
 
   const banned_ingredients_check: BannedIngredientCheck[] = (
     Array.isArray(r.banned_ingredients_check) ? r.banned_ingredients_check : []
@@ -251,6 +392,10 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
 
   return {
     product_info,
+    detected_category: normalizeDetectedCategory(r.detected_category),
+    verdict,
+    verdict_reason,
+    key_findings,
     legal_metrology_compliance,
     ingredient_analysis,
     dosage_analysis: normalizeDosageAnalysis(r.dosage_analysis),
@@ -259,4 +404,28 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
     banned_ingredients_check,
     ingredients_not_in_database,
   };
+}
+
+const VERDICTS: readonly string[] = ["safe", "caution", "avoid"];
+/** Coerce the model's verdict, deriving a sane one when it is missing/garbled. */
+export function normalizeVerdict(
+  raw: unknown,
+  safetyScore: number | null,
+  bannedCount: number,
+  harmfulCount: number,
+): "safe" | "caution" | "avoid" {
+  const s = String(raw ?? "").toLowerCase().trim();
+  if (VERDICTS.includes(s)) return s as "safe" | "caution" | "avoid";
+  if (s.includes("avoid") || s.includes("unsafe") || s.includes("danger"))
+    return "avoid";
+  if (s.includes("caution") || s.includes("moderate")) return "caution";
+  if (s === "safe" || s.includes("ok") || s.includes("good")) return "safe";
+  // Derive from the numbers when the model gave nothing usable.
+  if (bannedCount > 0) return "avoid";
+  if (safetyScore != null) {
+    if (safetyScore >= 75) return "safe";
+    if (safetyScore >= 50) return "caution";
+    return "avoid";
+  }
+  return harmfulCount > 0 ? "avoid" : "caution";
 }

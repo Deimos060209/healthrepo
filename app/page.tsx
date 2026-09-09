@@ -13,6 +13,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { getCommunityStats } from "@/lib/stats";
+import { getVerifiedSafeProducts } from "@/lib/safe-products-server";
 import { HealthProfilePrompt } from "@/components/HealthProfilePrompt";
 
 /** Re-fetch the community counters at most every 5 minutes (ISR). */
@@ -58,11 +59,18 @@ const SECONDARY: {
 
 const inr = new Intl.NumberFormat("en-IN");
 
+const scoreColor = (s: number) =>
+  s >= 80 ? "bg-green-500" : s >= 50 ? "bg-amber-500" : "bg-red-600";
+
 export default async function Home() {
-  const stats = await getCommunityStats();
+  const [stats, safeProducts] = await Promise.all([
+    getCommunityStats(),
+    getVerifiedSafeProducts(6),
+  ]);
   // Hide the section entirely when there is nothing real to report — an empty
   // or unavailable database should show no numbers rather than zeros.
   const showStats = stats !== null && stats.productsScanned > 0;
+  const hasSafeProducts = safeProducts.length >= 3;
 
   return (
     <>
@@ -165,6 +173,64 @@ export default async function Home() {
               </li>
             ))}
           </ol>
+        </section>
+
+        {/* 4b. Community verified safe products ------------------------- */}
+        <section className="mt-10">
+          <h2 className="text-xs font-semibold uppercase tracking-wider text-zinc-500">
+            🏆 Community verified safe products
+          </h2>
+          {hasSafeProducts ? (
+            <ul className="mt-3 grid gap-3 sm:grid-cols-2">
+              {safeProducts.map((p) => (
+                <li key={p.id}>
+                  <Link
+                    href={`/history/${p.id}`}
+                    className="flex items-center gap-3 rounded-2xl border border-zinc-200 bg-white p-3 transition-colors hover:border-teal-300 hover:bg-teal-50/50 dark:border-white/10 dark:bg-white/[0.03] dark:hover:border-teal-500/40 dark:hover:bg-teal-500/[0.06]"
+                  >
+                    <span
+                      className={`flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-sm font-bold text-white ${scoreColor(
+                        p.score,
+                      )}`}
+                    >
+                      {p.score}
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-semibold">
+                        {p.name}
+                      </span>
+                      {p.brand && (
+                        <span className="block truncate text-xs text-zinc-500">
+                          {p.brand}
+                        </span>
+                      )}
+                      <span className="mt-0.5 block text-[10px] text-zinc-400">
+                        Verified by {p.timesScanned}{" "}
+                        {p.timesScanned === 1 ? "scan" : "scans"}
+                      </span>
+                    </span>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <div className="mt-3 flex flex-col items-start gap-2 rounded-2xl border border-zinc-200 bg-white p-5 dark:border-white/10 dark:bg-white/[0.03]">
+              <p className="text-sm font-semibold">
+                Help build India&rsquo;s first verified safe products database
+              </p>
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                Scan products to verify their safety and help other consumers
+                make informed choices.
+              </p>
+              <Link
+                href="/scan"
+                className="mt-1 inline-flex items-center gap-2 rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white shadow-sm shadow-teal-600/30"
+              >
+                <ScanLine className="h-4 w-4" aria-hidden />
+                Start scanning →
+              </Link>
+            </div>
+          )}
         </section>
 
         {/* 5. Quick stats — omitted entirely until there is real data --- */}

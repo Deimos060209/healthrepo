@@ -8,9 +8,60 @@ import { useAuth } from "@/components/AuthProvider";
 
 type Mode = "signin" | "signup";
 
+interface AuthErr {
+  message: string;
+  /** Renders a helper link under the message. */
+  action?: "signup" | "signin";
+}
+
 function nextTarget(): string {
   if (typeof window === "undefined") return "/";
   return new URLSearchParams(window.location.search).get("next") || "/";
+}
+
+const MIN_PASSWORD = 6;
+
+/**
+ * Turn a raw Supabase auth error into something a user can act on — WITHOUT
+ * leaking whether an email is registered. Supabase deliberately returns the
+ * same "Invalid login credentials" for a wrong password and an unknown account;
+ * we keep that ambiguity and just make the copy more helpful.
+ */
+function mapAuthError(err: unknown): AuthErr {
+  const raw = (err instanceof Error ? err.message : String(err ?? "")).trim();
+  const m = raw.toLowerCase();
+
+  if (m.includes("invalid login credentials")) {
+    return {
+      message:
+        "That email and password don’t match. If you haven’t created an account yet, sign up first.",
+      action: "signup",
+    };
+  }
+  if (
+    m.includes("email rate limit exceeded") ||
+    m.includes("over_email_send_rate_limit") ||
+    m.includes("rate limit")
+  ) {
+    return {
+      message:
+        "Too many signup attempts right now. Please wait a few minutes and try again.",
+    };
+  }
+  if (m.includes("already registered") || m.includes("user_already_exists")) {
+    return {
+      message: "This email is already registered. Try signing in instead.",
+      action: "signin",
+    };
+  }
+  if (m.includes("password should be at least 6 characters")) {
+    return { message: "Password should be at least 6 characters." };
+  }
+  // Preserve our own client-side guard messages verbatim.
+  if (m.includes("please enter your name")) {
+    return { message: "Please enter your name." };
+  }
+  return { message: "Something went wrong. Please try again." };
 }
 
 export default function LoginPage() {
@@ -22,8 +73,19 @@ export default function LoginPage() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<AuthErr | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+
+  const passwordHint =
+    mode === "signup" && password.length > 0 && password.length < MIN_PASSWORD
+      ? `Password should be at least ${MIN_PASSWORD} characters.`
+      : undefined;
+
+  function switchMode(next: Mode) {
+    setMode(next);
+    setError(null);
+    setNotice(null);
+  }
 
   async function handleGoogle() {
     setBusy(true);
@@ -34,8 +96,11 @@ export default function LoginPage() {
       // Google provider hasn't been configured — meaningless to an end user.
       setError(
         /provider is not enabled|unsupported provider/i.test(error.message)
-          ? "Google sign-in isn’t set up yet. Please use your email and password below."
-          : error.message,
+          ? {
+              message:
+                "Google sign-in isn’t set up yet. Please use your email and password below.",
+            }
+          : mapAuthError(error),
       );
       setBusy(false);
     }
@@ -66,7 +131,7 @@ export default function LoginPage() {
         }
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong.");
+      setError(mapAuthError(err));
     } finally {
       setBusy(false);
     }
@@ -130,12 +195,31 @@ export default function LoginPage() {
           onChange={setPassword}
           placeholder="••••••••"
           required
+          hint={passwordHint}
         />
 
         {error && (
-          <p className="rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-300">
-            {error}
-          </p>
+          <div className="rounded-lg bg-red-500/10 px-3 py-2 text-xs text-red-700 dark:text-red-300">
+            <p>{error.message}</p>
+            {error.action === "signup" && (
+              <button
+                type="button"
+                onClick={() => switchMode("signup")}
+                className="mt-1 font-semibold underline underline-offset-2"
+              >
+                Create an account
+              </button>
+            )}
+            {error.action === "signin" && (
+              <button
+                type="button"
+                onClick={() => switchMode("signin")}
+                className="mt-1 font-semibold underline underline-offset-2"
+              >
+                Sign in
+              </button>
+            )}
+          </div>
         )}
         {notice && (
           <p className="flex items-start gap-2 rounded-lg bg-teal-600/10 px-3 py-2 text-xs text-teal-800 dark:text-teal-200">
@@ -160,11 +244,7 @@ export default function LoginPage() {
             Don&rsquo;t have an account?{" "}
             <button
               type="button"
-              onClick={() => {
-                setMode("signup");
-                setError(null);
-                setNotice(null);
-              }}
+              onClick={() => switchMode("signup")}
               className="font-semibold text-teal-700 dark:text-teal-300"
             >
               Sign Up
@@ -175,11 +255,7 @@ export default function LoginPage() {
             Already have an account?{" "}
             <button
               type="button"
-              onClick={() => {
-                setMode("signin");
-                setError(null);
-                setNotice(null);
-              }}
+              onClick={() => switchMode("signin")}
               className="font-semibold text-teal-700 dark:text-teal-300"
             >
               Sign In
@@ -206,6 +282,7 @@ function Field({
   placeholder,
   autoComplete,
   required,
+  hint,
 }: {
   label: string;
   type: string;
@@ -214,6 +291,7 @@ function Field({
   placeholder?: string;
   autoComplete?: string;
   required?: boolean;
+  hint?: string;
 }) {
   return (
     <label className="flex flex-col gap-1 text-xs font-medium text-zinc-600 dark:text-zinc-400">
@@ -225,8 +303,14 @@ function Field({
         placeholder={placeholder}
         autoComplete={autoComplete}
         required={required}
+        aria-invalid={hint ? true : undefined}
         className="rounded-xl border border-zinc-300 bg-transparent px-3 py-2.5 text-sm text-foreground placeholder:text-zinc-400 focus:border-teal-500 focus:outline-none focus:ring-1 focus:ring-teal-500 dark:border-white/15"
       />
+      {hint && (
+        <span className="font-normal text-amber-600 dark:text-amber-400">
+          {hint}
+        </span>
+      )}
     </label>
   );
 }

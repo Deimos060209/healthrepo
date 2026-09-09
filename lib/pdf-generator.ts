@@ -12,6 +12,10 @@
 
 import type { jsPDF as JsPDF } from "jspdf";
 import { HEALTHIER_ALTERNATIVES } from "@/lib/reference-data";
+import {
+  resolveCategory,
+  ingredientRiskPhrase,
+} from "@/lib/product-category";
 import type {
   ProductAnalysis,
   IngredientAnalysis,
@@ -57,14 +61,24 @@ export async function generateReport(
     throw new Error("generateReport(): a valid `analysis` object is required.");
   }
 
+  // BUG 4c — a photo that was not a packaged product never gets a report.
+  if (looksNotAPackagedProduct(a)) {
+    throw new Error(
+      "generateReport(): this scan is not a packaged product — no report generated.",
+    );
+  }
+
   const { jsPDF } = await import("jspdf");
   const doc = new jsPDF({ unit: "pt", format: "a4", compress: true });
+  // Every string written to the PDF is routed through sanitizeForPdf() so
+  // characters with no WinAnsi glyph (₹, arrows, …) never reach Helvetica.
+  installTextSanitizer(doc);
   const R = new Layout(doc);
 
   const scannedAt = input.scannedAt ? new Date(input.scannedAt) : new Date();
   const image = input.imageUrl ? await rasterizeImage(input.imageUrl) : null;
 
-  drawHeader(R, scannedAt, input.scanId ?? null, image);
+  drawHeader(R, a, scannedAt, input.scanId ?? null, image);
   drawProductInfo(R, a);
   drawPersonalAlerts(R, a);
   drawCompliance(R, a);
@@ -106,6 +120,118 @@ const TINT_ZINC: RGB = [244, 244, 245];
 const fill = (d: JsPDF, c: RGB) => d.setFillColor(c[0], c[1], c[2]);
 const stroke = (d: JsPDF, c: RGB) => d.setDrawColor(c[0], c[1], c[2]);
 const ink = (d: JsPDF, c: RGB) => d.setTextColor(c[0], c[1], c[2]);
+
+// ---------------------------------------------------------------------------
+// Text sanitisation (BUG 1)
+//
+// jsPDF's built-in Helvetica uses WinAnsi (CP1252) encoding. Any character
+// outside that set renders as garbage — most visibly ₹ (U+20B9) showing up
+// as "¹". sanitizeForPdf() maps the common offenders to ASCII and drops
+// anything else to a safe fallback. installTextSanitizer() wraps the four
+// jsPDF entry points that take strings so EVERY piece of text is cleaned,
+// no matter which section wrote it.
+// ---------------------------------------------------------------------------
+
+/** Unicode code points that CP1252 *can* represent in its 0x80–0x9F range. */
+const CP1252_EXTRA = new Set<number>([
+  0x20ac, 0x201a, 0x0192, 0x201e, 0x2026, 0x2020, 0x2021, 0x02c6, 0x2030,
+  0x0160, 0x2039, 0x0152, 0x017d, 0x2018, 0x2019, 0x201c, 0x201d, 0x2022,
+  0x2013, 0x2014, 0x02dc, 0x2122, 0x0161, 0x203a, 0x0153, 0x017e, 0x0178,
+]);
+
+function toWinAnsi(s: string): string {
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0) ?? 0;
+    if (cp <= 0xff || CP1252_EXTRA.has(cp)) {
+      out += ch;
+      continue;
+    }
+    // Strip accents / decompose; keep it only if the result is pure Latin-1.
+    const ascii = ch.normalize("NFKD").replace(/[̀-ͯ]/g, "");
+    out += ascii && /^[\x00-\xff]+$/.test(ascii) ? ascii : "?";
+  }
+  return out;
+}
+
+export function sanitizeForPdf(text: unknown): string {
+  if (text == null) return "";
+  const s = String(text)
+    .replace(/[₹₨]/g, "Rs. ") // ₹ rupee, ₨ old rupee sign
+    .replace(/[→➡]/g, "->")
+    .replace(/←/g, "<-")
+    .replace(/[≥≧]/g, ">=")
+    .replace(/[≤≦]/g, "<=")
+    .replace(/≠/g, "!=")
+    .replace(/[​-‍⁠﻿]/g, "") // zero-width joiners/spaces
+    .replace(/[ -   　]/g, " "); // exotic spaces
+  return toWinAnsi(s);
+}
+
+function installTextSanitizer(doc: JsPDF): void {
+  const rawText = doc.text.bind(doc);
+  doc.text = function (t: string | string[], x: number, y: number, ...rest: unknown[]) {
+    const clean = Array.isArray(t) ? t.map(sanitizeForPdf) : sanitizeForPdf(t);
+    return (rawText as (...a: unknown[]) => JsPDF)(clean, x, y, ...rest);
+  } as typeof doc.text;
+
+  const rawSplit = doc.splitTextToSize.bind(doc);
+  doc.splitTextToSize = function (t: string, len: number, ...rest: unknown[]) {
+    return (rawSplit as (...a: unknown[]) => string[])(sanitizeForPdf(t), len, ...rest);
+  } as typeof doc.splitTextToSize;
+
+  const rawWidth = doc.getTextWidth.bind(doc);
+  doc.getTextWidth = function (t: string) {
+    return (rawWidth as (s: string) => number)(sanitizeForPdf(t));
+  } as typeof doc.getTextWidth;
+
+  const rawLink = doc.textWithLink.bind(doc);
+  doc.textWithLink = function (t: string, x: number, y: number, options: unknown) {
+    return (rawLink as (...a: unknown[]) => number)(
+      sanitizeForPdf(t),
+      x,
+      y,
+      options,
+    );
+  } as typeof doc.textWithLink;
+}
+
+/**
+ * Clamp a wrapped-text block to `max` lines, ending the last kept line with
+ * an ellipsis when content was dropped. Never returns an empty array.
+ */
+function clampLines(lines: string[], max: number): string[] {
+  if (lines.length === 0) return ["—"];
+  if (lines.length <= max) return lines;
+  const kept = lines.slice(0, max);
+  const trimmed = kept[max - 1].replace(/\s+\S*$/, "").trimEnd();
+  kept[max - 1] = `${trimmed || kept[max - 1]}…`;
+  return kept;
+}
+
+/** True when a mandatory declaration is genuinely absent (not merely un-photographed). */
+function isGenuinelyMissing(i: ComplianceItem): boolean {
+  if (i.status) return i.status === "missing";
+  return !i.present && !isNotApplicable(i);
+}
+
+/**
+ * BUG 4c — refuse to build a report for a photo that was not a packaged
+ * product: an empty analysis (no ingredients, no declarations, no scores,
+ * no identity) or a category the router flagged as not-a-product.
+ */
+function looksNotAPackagedProduct(a: ProductAnalysis): boolean {
+  const cat = String(a.detected_category?.category ?? "");
+  if (/not[_\s-]?a[_\s-]?packaged|not[_\s-]?a[_\s-]?product/i.test(cat)) return true;
+  const noIngredients = (a.ingredient_analysis ?? []).length === 0;
+  const noCompliance =
+    Object.keys(a.legal_metrology_compliance ?? {}).length === 0;
+  const noScores =
+    a.overall_assessment?.safety_score == null &&
+    a.overall_assessment?.compliance_score == null;
+  const noIdentity = !a.product_info?.name && !a.product_info?.brand;
+  return noIngredients && noCompliance && noScores && noIdentity;
+}
 
 // ---------------------------------------------------------------------------
 // Domain helpers
@@ -171,8 +297,10 @@ function complianceVerdict(a: ProductAnalysis): {
   text: string;
   color: RGB;
 } {
+  // Declarations that were simply not photographed ('not_visible') are not
+  // failures — exclude them from the verdict denominator entirely.
   const items = Object.values(a.legal_metrology_compliance ?? {}).filter(
-    (v) => !isNotApplicable(v),
+    (v) => !isNotApplicable(v) && v.status !== "not_visible",
   );
   if (items.length === 0)
     return { key: "unknown", text: "COMPLIANCE NOT ASSESSED", color: MUTED };
@@ -251,7 +379,9 @@ class Layout {
     this.doc = doc;
     this.pageW = doc.internal.pageSize.getWidth();
     this.pageH = doc.internal.pageSize.getHeight();
-    this.bottom = this.pageH - this.margin - 44;
+    // Keep clear of the fixed footer block (rule + 2 credit lines + 2
+    // disclaimer lines drawn from pageH - margin - 34). BUG 5.
+    this.bottom = this.pageH - this.margin - 52;
     this.y = this.margin;
   }
 
@@ -278,7 +408,9 @@ class Layout {
     ink(this.doc, TEAL_DARK);
     this.doc.setFont("helvetica", "bold");
     this.doc.setFontSize(13);
-    this.doc.text(text.toUpperCase(), this.margin, this.y + 10);
+    this.doc.text(text.toUpperCase(), this.margin, this.y + 10, {
+      maxWidth: this.contentW,
+    });
     this.y += 15;
     stroke(this.doc, TEAL);
     this.doc.setLineWidth(1);
@@ -325,15 +457,40 @@ class Layout {
   }
 
   bigVerdict(text: string, color: RGB) {
-    this.ensure(34);
     this.gap(6);
     this.doc.setFont("helvetica", "bold");
     this.doc.setFontSize(17);
     ink(this.doc, color);
-    this.doc.text(text, this.margin + this.contentW / 2, this.y + 14, {
-      align: "center",
+    const maxW = this.contentW - 20;
+    const lines = this.doc.splitTextToSize(text, maxW) as string[];
+    const lineH = 22;
+    this.ensure(lines.length * lineH + 8);
+    lines.forEach((ln, i) => {
+      this.doc.text(ln, this.margin + this.contentW / 2, this.y + 14 + i * lineH, {
+        align: "center",
+        maxWidth: maxW,
+      });
     });
-    this.y += 30;
+    this.y += lines.length * lineH + 8;
+  }
+
+  /** BUG 4a — printed instead of a score bar when the label was only partly readable. */
+  insufficientScore(label: string) {
+    this.ensure(24);
+    ink(this.doc, INK);
+    this.doc.setFont("helvetica", "bold");
+    this.doc.setFontSize(9);
+    this.doc.text(label, this.margin, this.y + 9);
+    ink(this.doc, MUTED);
+    this.doc.setFont("helvetica", "normal");
+    this.doc.setFontSize(9);
+    this.doc.text(
+      "Insufficient data — partial label only",
+      this.margin + 118,
+      this.y + 9,
+      { maxWidth: this.contentW - 118 },
+    );
+    this.y += 20;
   }
 
   scoreBar(label: string, score: number) {
@@ -359,9 +516,13 @@ class Layout {
   }
 
   bullets(items: string[], color: RGB = INK) {
+    const lineH = 12.6;
+    const maxLines = Math.max(3, Math.floor((this.bottom - this.margin) / lineH));
     for (const it of items) {
-      const lines = this.doc.splitTextToSize(it, this.contentW - 14) as string[];
-      const lineH = 12.6;
+      const lines = clampLines(
+        this.doc.splitTextToSize(it, this.contentW - 14) as string[],
+        maxLines,
+      );
       this.ensure(lines.length * lineH);
       this.doc.setFont("helvetica", "normal");
       this.doc.setFontSize(9);
@@ -405,10 +566,18 @@ class Layout {
     drawHeaderRow();
     this.doc.setFontSize(8);
 
+    const bodyH = this.bottom - this.margin - headerH;
+    const maxCellLines = Math.max(3, Math.floor((bodyH - padY * 2) / lineH));
+
     rows.forEach((row, ri) => {
+      // BUG 5 — cap each cell so a single row can never be taller than the
+      // page body (which would force it to overflow or split across pages).
       const wrapped = row.map((cell, i) =>
-        this.doc.splitTextToSize(cell.text || "—", colW[i] - padX * 2),
-      ) as string[][];
+        clampLines(
+          this.doc.splitTextToSize(cell.text || "—", colW[i] - padX * 2) as string[],
+          maxCellLines,
+        ),
+      );
       const rowH = Math.max(
         18,
         ...wrapped.map((l) => l.length * lineH + padY * 2),
@@ -467,11 +636,13 @@ class Layout {
 
 function drawHeader(
   R: Layout,
+  a: ProductAnalysis,
   scannedAt: Date,
   scanId: string | null,
   image: RasterImage | null,
 ) {
   const { doc, margin, pageW } = R;
+  const cat = resolveCategory(a.detected_category);
 
   ink(doc, TEAL);
   doc.setFont("helvetica", "bold");
@@ -489,8 +660,20 @@ function drawHeader(
     margin,
     margin + 28,
   );
-  if (scanId) doc.text(`Report ID: ${scanId}`, margin, margin + 40);
+  doc.text(
+    `Product category: ${cat.label}  ·  Regulatory body: ${cat.regulatoryBody}`,
+    margin,
+    margin + 40,
+  );
+  if (scanId) doc.text(`Report ID: ${scanId}`, margin, margin + 52);
 
+  // Bottom of the text column (last baseline + a little descender room).
+  const textBlockBottom = margin + (scanId ? 52 : 40) + 6;
+
+  // BUG 3 — the divider must clear BOTH the text block and the photo. Draw
+  // the photo first so we know its real height, then place the rule below
+  // whichever is lower, with >= 8pt of breathing room.
+  let imageBottom = 0;
   if (image) {
     try {
       const maxW = 92;
@@ -501,16 +684,19 @@ function drawHeader(
         h = maxH;
         w = (image.width / image.height) * maxH;
       }
+      const iy = margin - 4;
       stroke(doc, LINE);
       doc.setLineWidth(0.5);
-      doc.rect(pageW - margin - w, margin - 4, w, h);
-      doc.addImage(image.dataUrl, "PNG", pageW - margin - w, margin - 4, w, h);
+      doc.rect(pageW - margin - w, iy, w, h);
+      doc.addImage(image.dataUrl, "PNG", pageW - margin - w, iy, w, h);
+      imageBottom = iy + h;
     } catch {
       /* embedding failed — carry on without the photo */
+      imageBottom = 0;
     }
   }
 
-  R.y = margin + 54;
+  R.y = Math.max(textBlockBottom, imageBottom) + 10;
   fill(doc, TEAL);
   doc.rect(margin, R.y, R.contentW, 2, "F");
   R.y += 14;
@@ -518,6 +704,7 @@ function drawHeader(
 
 function drawProductInfo(R: Layout, a: ProductAnalysis) {
   const p = a.product_info ?? ({} as ProductAnalysis["product_info"]);
+  const cat = resolveCategory(a.detected_category);
   R.heading("Product Information");
 
   const pairs: [string, string][] = [
@@ -533,26 +720,43 @@ function drawProductInfo(R: Layout, a: ProductAnalysis) {
     ["Country of origin", fmt(p.country_of_origin)],
   ];
 
+  // BUG 2 — each value wraps inside its half-width column and is capped at
+  // two lines (ellipsis on overflow) so nothing runs off the page or bleeds
+  // into the adjacent column. Row height follows the taller of the two cells.
   const colW = R.contentW / 2;
-  const rowH = 26;
-  pairs.forEach((pair, i) => {
-    if (i % 2 === 0) R.ensure(rowH);
-    const x = R.margin + (i % 2) * colW;
-    ink(R.doc, MUTED);
-    R.doc.setFont("helvetica", "bold");
-    R.doc.setFontSize(7);
-    R.doc.text(pair[0].toUpperCase(), x, R.y + 7);
-    ink(R.doc, INK);
-    R.doc.setFont("helvetica", "normal");
-    R.doc.setFontSize(9.5);
-    const line = (R.doc.splitTextToSize(pair[1], colW - 12) as string[])[0] ?? "—";
-    R.doc.text(line, x, R.y + 19);
-    if (i % 2 === 1 || i === pairs.length - 1) R.y += rowH;
-  });
+  const valW = colW - 12;
+  for (let i = 0; i < pairs.length; i += 2) {
+    const cells = [pairs[i], pairs[i + 1]].filter(Boolean) as [string, string][];
+    const wrapped = cells.map(([, value]) =>
+      clampLines(R.doc.splitTextToSize(value || "—", valW) as string[], 2),
+    );
+    const maxLines = Math.max(1, ...wrapped.map((w) => w.length));
+    const rowH = 12 + maxLines * 11 + 6;
+    R.ensure(rowH);
+    cells.forEach(([label], c) => {
+      const x = R.margin + c * colW;
+      ink(R.doc, MUTED);
+      R.doc.setFont("helvetica", "bold");
+      R.doc.setFontSize(7);
+      R.doc.text(label.toUpperCase(), x, R.y + 7);
+      ink(R.doc, INK);
+      R.doc.setFont("helvetica", "normal");
+      R.doc.setFontSize(9.5);
+      wrapped[c].forEach((ln, li) => {
+        R.doc.text(ln, x, R.y + 18 + li * 11);
+      });
+    });
+    R.y += rowH;
+  }
 
   R.gap(6);
   R.labelledParagraph("Manufacturer / packer & address", fmt(p.manufacturer_address));
   R.labelledParagraph("Consumer care", fmt(p.customer_care));
+  R.labelledParagraph(
+    "Regulations applied",
+    `${cat.label} — assessed under ${cat.act}, regulated by ${cat.regulatoryBody}.`,
+    TEAL_DARK,
+  );
 }
 
 function drawPersonalAlerts(R: Layout, a: ProductAnalysis) {
@@ -612,14 +816,21 @@ function drawCompliance(R: Layout, a: ProductAnalysis) {
     );
   } else {
     const rows: Cell[][] = entries.map(([key, item]) => {
-      const s =
-        item.present && item.compliant
-          ? { label: "OK", color: GREEN, tint: TINT_GREEN }
-          : item.present
-            ? { label: "ISSUE", color: AMBER, tint: TINT_AMBER }
-            : isNotApplicable(item)
-              ? { label: "N/A", color: MUTED, tint: TINT_ZINC }
+      const notVisible = item.status === "not_visible";
+      const s = isNotApplicable(item)
+        ? { label: "N/A", color: MUTED, tint: TINT_ZINC }
+        : notVisible
+          ? { label: "NOT VISIBLE", color: MUTED, tint: TINT_ZINC }
+          : item.present && item.compliant
+            ? { label: "OK", color: GREEN, tint: TINT_GREEN }
+            : item.present
+              ? { label: "ISSUE", color: AMBER, tint: TINT_AMBER }
               : { label: "MISSING", color: RED, tint: TINT_RED };
+      const issueText = isNotApplicable(item)
+        ? "Not applicable"
+        : notVisible
+          ? "This part of the label was not captured"
+          : fmt(item.issue);
       return [
         { text: declLabel(key), bold: true },
         {
@@ -630,8 +841,9 @@ function drawCompliance(R: Layout, a: ProductAnalysis) {
         },
         { text: fmt(item.value) },
         {
-          text: isNotApplicable(item) ? "Not applicable" : fmt(item.issue),
-          textColor: item.issue && !isNotApplicable(item) ? AMBER : INK,
+          text: issueText,
+          textColor:
+            item.issue && !isNotApplicable(item) && !notVisible ? AMBER : INK,
         },
       ];
     });
@@ -649,16 +861,26 @@ function drawCompliance(R: Layout, a: ProductAnalysis) {
 
   const verdict = complianceVerdict(a);
   const cScore = a.overall_assessment?.compliance_score;
+  const cInsufficient =
+    cScore == null ||
+    a.overall_assessment?.compliance_status === "insufficient_data";
+  // BUG 4a — never print a fabricated score for a partial label.
   R.bigVerdict(
-    typeof cScore === "number"
-      ? `${verdict.text}  ·  ${clamp(cScore)}/100`
-      : verdict.text,
+    cInsufficient ? verdict.text : `${verdict.text}  ·  ${clamp(cScore as number)}/100`,
     verdict.color,
   );
+  if (cInsufficient) {
+    R.paragraph("Insufficient data — partial label only", {
+      size: 9,
+      color: MUTED,
+      gapAfter: 4,
+    });
+  }
 
   if (verdict.key === "non_compliant" || verdict.key === "partial") {
+    // BUG 4b — list only genuinely missing declarations, never 'not_visible' ones.
     const violations = Object.entries(a.legal_metrology_compliance ?? {})
-      .filter(([, v]) => !isNotApplicable(v) && !(v.present && v.compliant))
+      .filter(([, v]) => isGenuinelyMissing(v) || (v.present && !v.compliant))
       .map(
         ([k, v]) =>
           `${declLabel(k)} — ${
@@ -674,6 +896,7 @@ function drawCompliance(R: Layout, a: ProductAnalysis) {
 
 function drawIngredients(R: Layout, a: ProductAnalysis) {
   const list = a.ingredient_analysis ?? [];
+  const catId = a.detected_category?.category;
   R.heading("Ingredient Safety Analysis");
 
   const counts = ingredientCounts(list);
@@ -725,6 +948,10 @@ function drawIngredients(R: Layout, a: ProductAnalysis) {
       const nameW = R.doc.getTextWidth(ing.name);
       R.chip(st.label, R.margin + nameW + 8, R.y, st.color, st.tint);
       R.y += 18;
+
+      const phrase = ingredientRiskPhrase(catId, ing.safety_status);
+      if (phrase)
+        R.paragraph(phrase, { size: 9, bold: true, color: st.color, gapAfter: 4 });
 
       if (ing.reason) R.labelledParagraph("Why this is concerning:", ing.reason);
       if (ing.health_effects)
@@ -902,8 +1129,18 @@ function drawOverall(R: Layout, a: ProductAnalysis) {
   const oa = a.overall_assessment;
   R.heading("Overall Assessment");
 
-  R.scoreBar("Safety score", oa?.safety_score ?? 0);
-  R.scoreBar("Compliance score", oa?.compliance_score ?? 0);
+  // BUG 4a — a null score means the label was only partly readable. Show the
+  // honest "insufficient data" line rather than a made-up bar at 0.
+  const safetyInsufficient =
+    oa?.safety_score == null || oa?.safety_status === "insufficient_data";
+  const complianceInsufficient =
+    oa?.compliance_score == null || oa?.compliance_status === "insufficient_data";
+
+  if (safetyInsufficient) R.insufficientScore("Safety score");
+  else R.scoreBar("Safety score", oa.safety_score as number);
+
+  if (complianceInsufficient) R.insufficientScore("Compliance score");
+  else R.scoreBar("Compliance score", oa.compliance_score as number);
   R.gap(4);
 
   if (oa?.summary) {
@@ -911,8 +1148,12 @@ function drawOverall(R: Layout, a: ProductAnalysis) {
     R.paragraph(oa.summary, { gapAfter: 8 });
   }
 
-  const band = scoreBand(oa?.safety_score ?? 0);
-  R.bigVerdict(recommendationText(oa?.safety_score ?? 0), band.rgb);
+  if (safetyInsufficient) {
+    R.bigVerdict("SAFETY VERDICT UNAVAILABLE — PARTIAL SCAN", MUTED);
+  } else {
+    const band = scoreBand(oa.safety_score as number);
+    R.bigVerdict(recommendationText(oa.safety_score as number), band.rgb);
+  }
   if (oa?.recommendation) {
     R.paragraph(oa.recommendation, { size: 9, color: MUTED });
   }
@@ -935,31 +1176,39 @@ function drawActions(R: Layout, a: ProductAnalysis) {
     { gapAfter: 6 },
   );
 
+  const cat = resolveCategory(a.detected_category);
   const links: { label: string; url?: string }[] = [
     {
-      label: "Legal Metrology / consumer complaints: consumerhelpline.gov.in",
-      url: "https://consumerhelpline.gov.in",
+      label: `Regulator for this product type: ${cat.regulatoryBody} (${cat.act})`,
     },
-    {
-      label: "FSSAI food safety complaints: foscos.fssai.gov.in/consumergrievance",
-      url: "https://foscos.fssai.gov.in/consumergrievance",
-    },
-    { label: "FSSAI Helpline: 1800-11-4420" },
+    ...cat.portals.map((portal) => ({
+      label: portal.phone
+        ? `${portal.label}: ${portal.url}  ·  call ${portal.phone}`
+        : `${portal.label}: ${portal.url}`,
+      url: portal.url,
+    })),
   ];
 
+  const lineH = 13;
   for (const l of links) {
-    R.ensure(15);
     R.doc.setFont("helvetica", "normal");
     R.doc.setFontSize(9);
+    // Regulator names and portal URLs are long — wrap them inside the content
+    // column instead of letting them run past the right margin. (BUG 5.)
+    const lines = clampLines(
+      R.doc.splitTextToSize(l.label, R.contentW - 14) as string[],
+      4,
+    );
+    R.ensure(lines.length * lineH + 2);
     R.doc.text("•", R.margin + 2, R.y + 8);
-    if (l.url) {
-      ink(R.doc, TEAL_DARK);
-      R.doc.textWithLink(l.label, R.margin + 14, R.y + 8, { url: l.url });
-    } else {
-      ink(R.doc, INK);
-      R.doc.text(l.label, R.margin + 14, R.y + 8);
-    }
-    R.y += 15;
+    ink(R.doc, l.url ? TEAL_DARK : INK);
+    lines.forEach((ln, i) => {
+      const ly = R.y + 8 + i * lineH;
+      // Every wrapped line of a portal entry links to the same URL.
+      if (l.url) R.doc.textWithLink(ln, R.margin + 14, ly, { url: l.url });
+      else R.doc.text(ln, R.margin + 14, ly);
+    });
+    R.y += lines.length * lineH + 2;
   }
   R.gap(4);
 }
@@ -972,7 +1221,10 @@ function drawFooters(R: Layout) {
 
   for (let i = 1; i <= total; i++) {
     doc.setPage(i);
-    const fy = pageH - margin - 26;
+    // Fixed position: rule at pageH - margin - 34, two credit lines, then up
+    // to two disclaimer lines ending at ~pageH - margin - 7. Layout.bottom
+    // stops body content 18pt above the rule so nothing collides. BUG 5.
+    const fy = pageH - margin - 34;
 
     stroke(doc, LINE);
     doc.setLineWidth(0.5);
@@ -981,12 +1233,14 @@ function drawFooters(R: Layout) {
     ink(doc, MUTED);
     doc.setFont("helvetica", "normal");
     doc.setFontSize(7.5);
-    doc.text("Generated by HealthRepo | healthrepo.vercel.app", margin, fy + 12);
-    doc.text(`Page ${i} of ${total}`, pageW - margin, fy + 12, { align: "right" });
+    doc.text("Generated by HealthRepo | healthrepo.vercel.app", margin, fy + 11);
+    doc.text(`Page ${i} of ${total}`, pageW - margin, fy + 11, { align: "right" });
 
     doc.setFontSize(6.6);
-    const lines = doc.splitTextToSize(disclaimer, pageW - margin * 2) as string[];
-    lines.forEach((ln, j) => doc.text(ln, margin, fy + 21 + j * 8));
+    const lines = (
+      doc.splitTextToSize(disclaimer, pageW - margin * 2) as string[]
+    ).slice(0, 2);
+    lines.forEach((ln, j) => doc.text(ln, margin, fy + 20 + j * 7.5));
   }
 }
 

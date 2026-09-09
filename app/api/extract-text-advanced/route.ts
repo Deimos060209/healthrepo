@@ -29,7 +29,7 @@ const SUPPORTED_MEDIA_TYPES: readonly VisionMediaType[] = [
 /** ~5 MB decoded is Anthropic's per-image cap; base64 inflates it by ~4/3. */
 const MAX_BASE64_CHARS = 7_000_000;
 
-const SYSTEM_PROMPT = `You are an expert at reading text from product packaging images, including blurry, curved, small, and low-contrast text. This image has already been attempted by OCR and a smaller model, both of which failed to extract sufficient text. Try your absolute best to read every piece of text on this package including:
+const SYSTEM_PROMPT = `You are an expert at reading text from product packaging images, including blurry, curved, small, and low-contrast text. This image has already been attempted by OCR and a smaller model, both of which failed to extract sufficient text. The text in this image may be rotated, curved around a cylindrical package, printed on crinkled foil, or partially obscured. Read it in whatever orientation it appears. If part of the label is cut off or unreadable, extract everything you can and note which sections were unreadable. Try your absolute best to read every piece of text on this package including:
 - Product name and brand
 - Complete ingredients list (this is the MOST important part)
 - MRP and price information
@@ -118,6 +118,11 @@ export async function POST(request: Request) {
     const message = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 3000,
+      // Extended thinking is on by default for claude-sonnet-5 and its tokens
+      // come out of max_tokens, so a thinking block can swallow the whole
+      // budget and leave no transcription behind. This tier only has to READ
+      // the label — turn thinking off so the entire budget is text.
+      thinking: { type: "disabled" },
       system: SYSTEM_PROMPT,
       messages: [
         {

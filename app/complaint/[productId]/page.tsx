@@ -18,8 +18,10 @@ import { PageHeader } from "@/components/PageHeader";
 import { useToast } from "@/components/ToastProvider";
 import { supabase } from "@/lib/supabase";
 import { findAdditiveLimit } from "@/lib/reference-data";
+import { resolveCategory, type CategoryMeta } from "@/lib/product-category";
 import type {
   ComplianceItem,
+  DetectedCategory,
   DosageAnalysis,
   IngredientAnalysis,
   LimitCheck,
@@ -37,6 +39,7 @@ interface ScanRow {
   product_name: string;
   brand: string | null;
   category: string | null;
+  detected_category: DetectedCategory | null;
   image_url: string | null;
   compliance_status: "compliant" | "non_compliant" | "partial" | null;
   compliance_details: Record<string, ComplianceItem> | null;
@@ -137,12 +140,21 @@ function buildDosageComplaintBlock(
   ].join("\n");
 }
 
-function regulationsViolated(status: SafetyStatus): string {
+function regulationsViolated(status: SafetyStatus, cat: CategoryMeta): string {
+  const isFood =
+    cat.id === "food_and_beverages" || cat.id === "baby_product_food";
+  if (isFood) {
+    if (status === "banned")
+      return "Food Safety and Standards (Prohibition and Restrictions on Sales) Regulations, 2011; not a permitted additive under the Food Safety and Standards (Food Products Standards and Food Additives) Regulations, 2011.";
+    if (status === "harmful")
+      return "Food Safety and Standards (Food Products Standards and Food Additives) Regulations, 2011 (permitted-additive and maximum-limit provisions) and the Food Safety and Standards (Labelling and Display) Regulations, 2020.";
+    return "Food Safety and Standards Act, 2006 and the regulations framed thereunder.";
+  }
   if (status === "banned")
-    return "Food Safety and Standards (Prohibition and Restrictions on Sales) Regulations, 2011; not a permitted additive under the Food Safety and Standards (Food Products Standards and Food Additives) Regulations, 2011.";
+    return `Prohibited ingredient under the ${cat.act}; its presence makes the product misbranded / adulterated.`;
   if (status === "harmful")
-    return "Food Safety and Standards (Food Products Standards and Food Additives) Regulations, 2011 (permitted-additive and maximum-limit provisions) and the Food Safety and Standards (Labelling and Display) Regulations, 2020.";
-  return "Food Safety and Standards Act, 2006 and the regulations framed thereunder.";
+    return `${cat.act} and the applicable BIS / CDSCO safety and labelling standards for ${cat.label} products.`;
+  return `${cat.act} and the rules framed thereunder.`;
 }
 
 const longDate = (d: Date) =>
@@ -208,12 +220,20 @@ function buildIngredientComplaint(
   ingredients: IngredientAnalysis[],
   date: string,
   place: string,
+  cat: CategoryMeta,
 ): string {
+  const isFood =
+    cat.id === "food_and_beverages" || cat.id === "baby_product_food";
   const fssai = row.compliance_details?.fssai_license?.value;
   const fssaiLine =
     fssai && fssai.trim() ? fssai.trim() : "Not declared / not legible on the pack";
+  const licenceLabel = isFood
+    ? "FSSAI licence number on the pack"
+    : "Licence / registration / batch number on the pack";
 
-  const dosageBlock = buildDosageComplaintBlock(row.dosage_analysis);
+  const dosageBlock = isFood
+    ? buildDosageComplaintBlock(row.dosage_analysis)
+    : "";
 
   const items = ingredients.length
     ? ingredients
@@ -230,7 +250,7 @@ function buildIngredientComplaint(
             ing.banned_in_countries?.length
               ? `   Banned / restricted in: ${ing.banned_in_countries.join(", ")}`
               : null,
-            `   Regulation(s) violated: ${regulationsViolated(ing.safety_status)}`,
+            `   Regulation(s) violated: ${regulationsViolated(ing.safety_status, cat)}`,
           ]
             .filter(Boolean)
             .join("\n"),
@@ -239,26 +259,32 @@ function buildIngredientComplaint(
     : "1. (No harmful or banned ingredient was auto-detected — describe your concern.)";
 
   return [
-    "To: Food Safety and Standards Authority of India (FSSAI) — Consumer Grievance Cell",
+    `To: ${cat.regulatoryBody} — Consumer Grievance Cell`,
     "",
-    "Subject: Complaint regarding unsafe / non-permitted ingredients in a packaged food product",
+    `Subject: Complaint regarding unsafe / non-permitted ingredients in a packaged ${cat.label.toLowerCase()} product`,
     "",
     "Product details",
     `- Product name: ${pick(row.product_name)}`,
     `- Brand: ${pick(row.brand)}`,
-    `- FSSAI licence number on the pack: ${fssaiLine}`,
-    `- Category: ${row.category ? titleCase(row.category) : "Not specified"}`,
+    `- ${licenceLabel}: ${fssaiLine}`,
+    `- Product type: ${cat.label}${
+      row.category ? ` (${titleCase(row.category)})` : ""
+    }`,
     `- Date of purchase: ${fmtPurchaseDate(date)}`,
     `- Place of purchase: ${place.trim() || "__________ (please fill in)"}`,
     "",
-    "On examining the product label, the following ingredient(s) raise serious food-safety concerns:",
+    `On examining the product label, the following ingredient(s) raise serious ${
+      isFood ? "food-safety" : "safety"
+    } concerns:`,
     "",
     items,
     ...(dosageBlock ? ["", dosageBlock] : []),
     "",
-    "This product contains ingredients that violate the Food Safety and Standards Act, 2006 and the regulations framed thereunder, including the Food Safety and Standards (Food Products Standards and Food Additives) Regulations, 2011 and, where applicable, the Food Safety and Standards (Prohibition and Restrictions on Sales) Regulations, 2011.",
+    `This product contains ingredients that violate the ${cat.act} and the rules and standards framed thereunder.`,
     "",
-    "I request that samples of this product be drawn and tested, and that action be taken against the manufacturer and the seller under the Act. I am attaching a photograph of the product and its ingredients list.",
+    isFood
+      ? "I request that samples of this product be drawn and tested, and that action be taken against the manufacturer and the seller under the Act. I am attaching a photograph of the product and its ingredients list."
+      : "I request that the matter be investigated and that action be taken against the manufacturer and the seller under the applicable law. I am attaching a photograph of the product and its ingredients list.",
     "",
     "Complainant details",
     "- Name: ____________________",
@@ -286,11 +312,11 @@ const COMPLIANCE_STEPS = [
 ];
 const INGREDIENT_STEPS = [
   "Click ‘Copy Complaint Text’ above.",
-  "Click ‘Open FSSAI Portal’ — it will open in a new tab.",
+  "Click ‘Open Portal’ — it will open in a new tab.",
   "Register with your mobile number (OTP verification).",
-  "Select complaint type: ‘Packaged Food’.",
+  "Select the complaint type that matches this product.",
   "Paste the complaint text and upload the product photo.",
-  "Submit — you’ll receive a ticket number via SMS.",
+  "Submit — you’ll receive a ticket / docket number.",
 ];
 
 const CONSUMER_PORTAL = "https://consumerhelpline.gov.in";
@@ -344,7 +370,7 @@ export default function ComplaintPage({
       const { data, error } = await supabase
         .from("scanned_products")
         .select(
-          "id, product_name, brand, category, image_url, compliance_status, compliance_details, ingredient_analysis, dosage_analysis, overall_score, scanned_at",
+          "id, product_name, brand, category, detected_category, image_url, compliance_status, compliance_details, ingredient_analysis, dosage_analysis, overall_score, scanned_at",
         )
         .eq("id", productId)
         .eq("user_id", user.id)
@@ -384,12 +410,22 @@ export default function ComplaintPage({
     [row],
   );
 
+  // Which law + portal governs this product (food / personal care / household / baby).
+  const cat = useMemo(
+    () => resolveCategory(row?.detected_category ?? null),
+    [row],
+  );
+  const ingredientPortal = cat.portals[0] ?? {
+    label: "FSSAI Food Safety Connect",
+    url: FSSAI_PORTAL,
+  };
+
   const generate = useCallback((): string => {
     if (!row || option === "none") return "";
     return option === "compliance"
       ? buildComplianceComplaint(row, violations, purchaseDate, purchasePlace)
-      : buildIngredientComplaint(row, unsafe, purchaseDate, purchasePlace);
-  }, [row, option, violations, unsafe, purchaseDate, purchasePlace]);
+      : buildIngredientComplaint(row, unsafe, purchaseDate, purchasePlace, cat);
+  }, [row, option, violations, unsafe, purchaseDate, purchasePlace, cat]);
 
   useEffect(() => {
     if (option === "none" || !row || touched) return;
@@ -436,7 +472,7 @@ export default function ComplaintPage({
         complaint_text: draft,
         purchase_date: purchaseDate || null,
         purchase_place: purchasePlace.trim() || null,
-        portal: type === "compliance" ? CONSUMER_PORTAL : FSSAI_PORTAL,
+        portal: type === "compliance" ? CONSUMER_PORTAL : ingredientPortal.url,
         product_name: row.product_name,
         brand: row.brand,
         violations: type === "compliance" ? violations : undefined,
@@ -537,7 +573,8 @@ export default function ComplaintPage({
 
   // ----- success screen -----
   if (filed) {
-    const portal = filed.type === "compliance" ? CONSUMER_PORTAL : FSSAI_PORTAL;
+    const portal =
+      filed.type === "compliance" ? CONSUMER_PORTAL : ingredientPortal.url;
     return (
       <main className="mx-auto flex w-full max-w-lg flex-1 flex-col gap-6 px-4 pb-28 pt-6 md:pb-12">
         <PageHeader title="File a complaint" backHref={`/history/${productId}`} backLabel="Scan results" />
@@ -622,6 +659,11 @@ export default function ComplaintPage({
           <h2 className="truncate text-sm font-semibold">{row.product_name}</h2>
           {row.brand && <p className="truncate text-xs text-zinc-500">{row.brand}</p>}
           <div className="mt-2 flex flex-wrap gap-1.5 text-[11px] font-medium">
+            <span
+              className={`rounded-full px-2 py-0.5 ${cat.badgeClass}`}
+            >
+              {cat.emoji} {cat.label}
+            </span>
             <span className="rounded-full bg-amber-100 px-2 py-0.5 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300">
               {violations.length} compliance{" "}
               {violations.length === 1 ? "issue" : "issues"}
@@ -762,7 +804,7 @@ export default function ComplaintPage({
           <p className="text-xs font-medium">
             {option === "compliance"
               ? "This product violates the Legal Metrology (Packaged Commodities) Rules, 2011."
-              : "This product contains ingredients that violate the FSSAI Food Safety and Standards Act, 2006."}
+              : `This product contains ingredients that violate the ${cat.act} (regulated by ${cat.regulatoryBody}).`}
           </p>
 
           {/* editable complaint text */}
@@ -805,7 +847,9 @@ export default function ComplaintPage({
               Copy Complaint Text
             </button>
             <a
-              href={option === "compliance" ? CONSUMER_PORTAL : FSSAI_PORTAL}
+              href={
+                option === "compliance" ? CONSUMER_PORTAL : ingredientPortal.url
+              }
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-2 rounded-xl border border-zinc-300 px-4 py-2.5 text-sm font-semibold dark:border-white/15"
@@ -813,14 +857,14 @@ export default function ComplaintPage({
               <ExternalLink className="h-4 w-4" aria-hidden />
               {option === "compliance"
                 ? "Open Consumer Helpline Portal"
-                : "Open FSSAI Food Safety Connect"}
+                : `Open ${ingredientPortal.label}`}
             </a>
           </div>
 
-          {option === "ingredients" && (
+          {option === "ingredients" && ingredientPortal.phone && (
             <p className="inline-flex items-center gap-2 rounded-lg bg-teal-600/10 px-3 py-2 text-xs font-medium text-teal-800 dark:text-teal-200">
               <Phone className="h-4 w-4 shrink-0" aria-hidden />
-              FSSAI Toll-Free Helpline: 1800-11-4420
+              {ingredientPortal.label} helpline: {ingredientPortal.phone}
             </p>
           )}
 

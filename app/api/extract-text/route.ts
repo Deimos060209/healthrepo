@@ -29,7 +29,7 @@ const SUPPORTED_MEDIA_TYPES: readonly VisionMediaType[] = [
 const MAX_BASE64_CHARS = 7_000_000;
 
 const SYSTEM_PROMPT =
-  "Extract ALL text visible on this product package. Return the raw text exactly as printed, preserving layout. Include ingredients, MRP, dates, manufacturer info, FSSAI number, nutritional info, everything. Return ONLY the extracted text, nothing else.";
+  "Extract ALL text visible on this product package. Return the raw text exactly as printed, preserving layout. Include ingredients, MRP, dates, manufacturer info, FSSAI number, nutritional info, everything. The text in this image may be rotated, curved around a cylindrical package, printed on crinkled foil, or partially obscured. Read it in whatever orientation it appears. If part of the label is cut off or unreadable, extract everything you can and note which sections were unreadable. Return ONLY the extracted text, nothing else.";
 
 function jsonError(
   message: string,

@@ -2259,3 +2259,627 @@ export const REFERENCE_METADATA = {
   },
 };
 
+// ============================================================================
+// 7. PRODUCT-CATEGORY-SPECIFIC SAFETY DATA
+// ============================================================================
+// HealthRepo scans EVERY kind of packaged product, not just food. Each broad
+// category is governed by a different law and a different regulator, bans a
+// different set of ingredients, and needs a different label checklist. The
+// /api/analyze prompt detects the category first (PHASE 1) and then applies the
+// matching rules from here (PHASE 2).
+
+export interface ProductCategoryRule {
+  regulatory_body: string;
+  act: string;
+  complaint_portal: string;
+  required_labels: string[];
+  additional_checks: string[];
+}
+
+/** Broad regulatory buckets. Keyed by the `detected_category` id the model returns. */
+export const PRODUCT_CATEGORY_RULES: Record<string, ProductCategoryRule> = {
+  food_and_beverages: {
+    regulatory_body: "FSSAI (Food Safety and Standards Authority of India)",
+    act: "Food Safety and Standards Act, 2006",
+    complaint_portal: "https://foscos.fssai.gov.in/consumergrievance",
+    required_labels: [
+      "FSSAI license number",
+      "Ingredients list in descending order",
+      "Nutritional info table",
+      "Veg/Non-veg symbol",
+      "Allergen declaration",
+      "Best before/Use by date",
+      "MRP",
+      "Net weight",
+      "Manufacturer details",
+    ],
+    additional_checks: [
+      "Check against FSSAI banned ingredients",
+      "Check additive limits",
+      "Check trans fat limit (max 2%)",
+      "Verify FSSAI 14-digit license format",
+    ],
+  },
+
+  personal_care: {
+    regulatory_body: "CDSCO (Central Drugs Standard Control Organisation) and BIS",
+    act: "Drugs and Cosmetics Act, 1940 and BIS standards",
+    complaint_portal:
+      "https://cdsco.gov.in/opencms/opencms/en/consumer-corner/",
+    required_labels: [
+      "Batch/Lot number",
+      "Manufacturing date",
+      "Expiry/Best before date",
+      "MRP",
+      "Net quantity",
+      "Manufacturer name and address",
+      "Ingredients list",
+      "Directions for use",
+      "Warnings/Cautions",
+      "IS/ISO certification mark (if applicable)",
+    ],
+    additional_checks: [
+      "Check against banned cosmetic ingredients",
+      "Check for carcinogenic compounds",
+      "Check for allergens",
+      "Verify no prohibited heavy metals",
+    ],
+  },
+
+  household_cleaning: {
+    regulatory_body: "BIS (Bureau of Indian Standards)",
+    act: "Bureau of Indian Standards Act, 2016",
+    complaint_portal: "https://consumerhelpline.gov.in",
+    required_labels: [
+      "Batch number",
+      "Manufacturing date",
+      "MRP",
+      "Net quantity",
+      "Manufacturer details",
+      "Directions for use",
+      "Safety warnings",
+      "First aid instructions",
+      "Hazard symbols (if applicable)",
+      "Keep out of reach of children warning",
+    ],
+    additional_checks: [
+      "Check for banned chemicals",
+      "Check for corrosive/toxic warnings",
+      "Verify safety data",
+    ],
+  },
+
+  // Baby products inherit their parent regulator (food -> FSSAI, care -> CDSCO)
+  // but add the extra labels and the zero-tolerance checks. These are real keys
+  // rather than a single `baby_products` bucket so that buildCompactReference()
+  // and /api/analyze can look a baby category up directly.
+  baby_product_food: {
+    regulatory_body: "FSSAI (Food Safety and Standards Authority of India)",
+    act: "Food Safety and Standards Act, 2006 (infant-food provisions)",
+    complaint_portal: "https://foscos.fssai.gov.in/consumergrievance",
+    required_labels: [
+      "FSSAI license number",
+      "Ingredients list in descending order",
+      "Nutritional info table",
+      "Veg/Non-veg symbol",
+      "Allergen declaration",
+      "Best before/Use by date",
+      "MRP",
+      "Net weight",
+      "Manufacturer details",
+      "Age recommendation (e.g. 'for infants above 6 months')",
+      "Mandatory breastfeeding statement for infant milk substitutes",
+      "Preparation and storage instructions",
+    ],
+    additional_checks: [
+      "ZERO tolerance for banned ingredients",
+      "Stricter limits on all additives",
+      "No artificial sweeteners",
+      "No artificial colors",
+      "Check against EU baby food standards (stricter than India)",
+      "Verify FSSAI 14-digit license format",
+    ],
+  },
+
+  baby_product_care: {
+    regulatory_body: "CDSCO (Central Drugs Standard Control Organisation) and BIS",
+    act: "Drugs and Cosmetics Act, 1940 (children's cosmetics provisions)",
+    complaint_portal:
+      "https://cdsco.gov.in/opencms/opencms/en/consumer-corner/",
+    required_labels: [
+      "Batch/Lot number",
+      "Manufacturing date",
+      "Expiry/Best before date",
+      "MRP",
+      "Net quantity",
+      "Manufacturer name and address",
+      "Ingredients list",
+      "Directions for use",
+      "Warnings/Cautions",
+      "Age suitability statement",
+      "Paediatric / dermatological test statement where claimed",
+    ],
+    additional_checks: [
+      "ZERO tolerance for banned cosmetic ingredients",
+      "No parabens, formaldehyde donors or phthalates in infant products",
+      "Check for allergens and undisclosed fragrance",
+      "Verify no prohibited heavy metals",
+      "Check against EU children's-cosmetics standards (stricter than India)",
+    ],
+  },
+};
+
+export interface PersonalCareBannedIngredient {
+  name: string;
+  why_banned: string;
+  health_effects: string;
+  found_in: string[];
+  severity: "critical" | "high" | "medium";
+}
+
+/** Ingredients banned or tightly restricted in cosmetics / personal care in India. */
+export const PERSONAL_CARE_BANNED_INGREDIENTS: PersonalCareBannedIngredient[] = [
+  {
+    name: "Mercury and mercury compounds",
+    why_banned:
+      "Highly toxic heavy metal. Causes kidney damage, nervous system damage, skin irritation. Banned in skin lightening creams.",
+    health_effects:
+      "Mercury accumulates in the body. Causes tremors, memory loss, kidney failure. Particularly dangerous during pregnancy — causes birth defects.",
+    found_in: [
+      "skin lightening creams",
+      "fairness creams",
+      "anti-aging creams",
+    ],
+    severity: "critical",
+  },
+  {
+    name: "Hydroquinone (above 2%)",
+    why_banned:
+      "Banned in OTC cosmetics above 2% concentration. Causes ochronosis (permanent blue-black skin darkening), liver damage.",
+    health_effects:
+      "Causes irreversible skin damage called exogenous ochronosis. Linked to liver and kidney damage. May be carcinogenic.",
+    found_in: ["skin lightening products", "spot treatment creams"],
+    severity: "critical",
+  },
+  {
+    name: "Lead acetate",
+    why_banned:
+      "Toxic heavy metal compound. Banned in hair dyes and cosmetics.",
+    health_effects:
+      "Lead is a cumulative neurotoxin. Causes brain damage, especially in children. Damages kidneys and reproductive system.",
+    found_in: ["some hair dyes", "kohl/kajal"],
+    severity: "critical",
+  },
+  {
+    name: "Formaldehyde and formaldehyde releasers (above 0.2%)",
+    why_banned:
+      "Carcinogenic preservative. Allowed below 0.2% but many products exceed this.",
+    health_effects:
+      "Confirmed carcinogen (IARC Group 1). Causes skin irritation, respiratory issues, and allergic reactions. Found as DMDM Hydantoin, Quaternium-15, Imidazolidinyl Urea on labels.",
+    found_in: [
+      "shampoos",
+      "body washes",
+      "nail polish",
+      "hair straightening treatments",
+    ],
+    severity: "critical",
+  },
+  {
+    name: "Parabens (Propylparaben, Butylparaben, Isopropylparaben, Isobutylparaben)",
+    why_banned: "Restricted/banned in many countries. Endocrine disruptors.",
+    health_effects:
+      "Mimic estrogen in the body. Linked to breast cancer, reproductive issues, and hormonal imbalance. EU has banned several types.",
+    found_in: ["shampoos", "conditioners", "lotions", "face creams"],
+    severity: "high",
+  },
+  {
+    name: "Triclosan",
+    why_banned:
+      "Banned by FDA in consumer antiseptic products. Endocrine disruptor.",
+    health_effects:
+      "Disrupts thyroid function, contributes to antibiotic resistance, may promote cancer. Harmful to aquatic life.",
+    found_in: ["antibacterial soaps", "hand sanitizers", "toothpaste"],
+    severity: "high",
+  },
+  {
+    name: "Diethanolamine (DEA), Triethanolamine (TEA), Monoethanolamine (MEA)",
+    why_banned:
+      "Can react with other ingredients to form carcinogenic nitrosamines.",
+    health_effects:
+      "Skin irritation, organ toxicity. When combined with nitrites (common in cosmetics), forms cancer-causing nitrosamines.",
+    found_in: ["shampoos", "body washes", "facial cleansers"],
+    severity: "high",
+  },
+  {
+    name: "Phthalates (DBP, DEHP, DEP)",
+    why_banned: "Endocrine disruptors. Banned in EU cosmetics.",
+    health_effects:
+      "Disrupt hormones, linked to reproductive problems, birth defects, and early puberty. Often hidden under 'fragrance' on labels.",
+    found_in: [
+      "nail polish",
+      "hair sprays",
+      "perfumes",
+      "any product listing 'fragrance'",
+    ],
+    severity: "high",
+  },
+  {
+    name: "Toluene",
+    why_banned: "Toxic solvent. Restricted in cosmetics.",
+    health_effects:
+      "Causes headaches, dizziness, respiratory issues. Can damage liver, kidneys, and nervous system. Harmful to developing fetuses.",
+    found_in: ["nail polish", "hair dyes"],
+    severity: "high",
+  },
+  {
+    name: "Coal tar dyes (P-Phenylenediamine above limits)",
+    why_banned: "Carcinogenic. Causes severe allergic reactions.",
+    health_effects:
+      "Causes skin allergies, asthma, cancer risk. PPD in hair dyes causes severe dermatitis in sensitive individuals.",
+    found_in: ["hair dyes", "dark-colored cosmetics"],
+    severity: "high",
+  },
+  {
+    name: "Microbeads (plastic microbeads)",
+    why_banned: "Banned in India since 2020 for environmental damage.",
+    health_effects:
+      "Don't biodegrade, enter water supply, consumed by marine life. Enter human food chain.",
+    found_in: ["exfoliating face washes", "scrubs", "toothpaste"],
+    severity: "critical",
+  },
+  {
+    name: "Petroleum jelly / Mineral oil (low grade)",
+    why_banned: "Low-grade mineral oil contains carcinogenic PAHs.",
+    health_effects:
+      "Low-grade versions contain polycyclic aromatic hydrocarbons (carcinogenic). Clogs pores, prevents skin from breathing.",
+    found_in: ["moisturizers", "lip balms", "baby oil"],
+    severity: "medium",
+  },
+];
+
+export interface PersonalCareHarmfulAdditive {
+  name: string;
+  concern_level: "low" | "medium" | "high";
+  why_concerning: string;
+  who_should_avoid: string;
+  healthier_alternative: string;
+}
+
+/** Legal in personal care, but worth flagging as 'caution'. */
+export const PERSONAL_CARE_HARMFUL_ADDITIVES: PersonalCareHarmfulAdditive[] = [
+  {
+    name: "Sodium Lauryl Sulfate (SLS)",
+    concern_level: "medium",
+    why_concerning:
+      "Strong detergent that strips natural oils. Causes skin and eye irritation. Not toxic but unnecessarily harsh.",
+    who_should_avoid: "People with eczema, sensitive skin, dry hair",
+    healthier_alternative:
+      "Sodium Lauryl Sulfoacetate (SLSA), Cocamidopropyl Betaine, Decyl Glucoside",
+  },
+  {
+    name: "Sodium Laureth Sulfate (SLES)",
+    concern_level: "medium",
+    why_concerning:
+      "Milder than SLS but can be contaminated with 1,4-dioxane (a carcinogen) during manufacturing.",
+    who_should_avoid: "Sensitive skin, children",
+    healthier_alternative: "Coco-glucoside, Lauryl Glucoside",
+  },
+  {
+    name: "Synthetic fragrances (listed as 'Fragrance' or 'Parfum')",
+    concern_level: "high",
+    why_concerning:
+      "Can contain hundreds of undisclosed chemicals including phthalates and allergens. Companies aren't required to list what's inside 'fragrance'.",
+    who_should_avoid:
+      "Everyone — prefer products listing actual essential oils",
+    healthier_alternative:
+      "Products listing specific essential oils or 'fragrance-free'",
+  },
+  {
+    name: "Silicones (Dimethicone, Cyclomethicone)",
+    concern_level: "low",
+    why_concerning:
+      "Not toxic but coat hair/skin, preventing moisture. Build up over time.",
+    who_should_avoid: "People with fine or thin hair",
+    healthier_alternative: "Argan oil, jojoba oil, shea butter",
+  },
+  {
+    name: "Artificial colors (FD&C dyes, CI numbers)",
+    concern_level: "medium",
+    why_concerning:
+      "Serve no functional purpose in personal care. Some are derived from coal tar or petroleum.",
+    who_should_avoid: "Sensitive skin, children",
+    healthier_alternative:
+      "Products without added colors, or those using natural colorants",
+  },
+  {
+    name: "Propylene Glycol",
+    concern_level: "low",
+    why_concerning:
+      "Generally safe but can cause irritation in sensitive individuals at high concentrations.",
+    who_should_avoid: "People with very sensitive or broken skin",
+    healthier_alternative: "Vegetable glycerin",
+  },
+  {
+    name: "Aluminum compounds (in antiperspirants)",
+    concern_level: "medium",
+    why_concerning:
+      "Blocks sweat glands. Debated links to breast cancer and Alzheimer's (not conclusive but concerning).",
+    who_should_avoid: "Those who prefer precautionary approach",
+    healthier_alternative:
+      "Natural deodorants with baking soda, charcoal, or magnesium",
+  },
+  {
+    name: "Oxybenzone (Benzophenone-3)",
+    concern_level: "high",
+    why_concerning:
+      "Chemical sunscreen that disrupts hormones. Banned in Hawaii for coral reef damage. Absorbed through skin into bloodstream.",
+    who_should_avoid:
+      "Children, pregnant women, everyone if mineral alternatives available",
+    healthier_alternative:
+      "Zinc oxide or titanium dioxide based mineral sunscreens",
+  },
+  {
+    name: "BHA and BHT in cosmetics",
+    concern_level: "high",
+    why_concerning:
+      "Same antioxidants that are concerning in food. Endocrine disruptors. Classified as possible carcinogens.",
+    who_should_avoid: "Everyone",
+    healthier_alternative: "Vitamin E (tocopherol), rosemary extract",
+  },
+];
+
+export interface HouseholdProductSafetyEntry {
+  name: string;
+  concern_level: "low" | "medium" | "high";
+  why_concerning: string;
+  safety_note: string;
+  healthier_alternative: string;
+}
+
+/** Concerning chemicals in household cleaning products. */
+export const HOUSEHOLD_PRODUCT_SAFETY: HouseholdProductSafetyEntry[] = [
+  {
+    name: "Chlorine bleach (Sodium Hypochlorite)",
+    concern_level: "high",
+    why_concerning:
+      "Produces toxic chlorine gas. NEVER mix with ammonia or acids — creates lethal gas.",
+    safety_note: "Use in ventilated areas, wear gloves",
+    healthier_alternative:
+      "Hydrogen peroxide based cleaners, oxygen bleach",
+  },
+  {
+    name: "Ammonia",
+    concern_level: "high",
+    why_concerning:
+      "Irritates lungs, eyes. NEVER mix with bleach — produces chloramine gas which can be fatal.",
+    safety_note: "Use in well-ventilated areas only",
+    healthier_alternative: "White vinegar, baking soda",
+  },
+  {
+    name: "Phosphates",
+    concern_level: "medium",
+    why_concerning:
+      "Causes water pollution and algal blooms. Banned in many countries for dishwasher/laundry detergents.",
+    safety_note: "Environmental concern more than health",
+    healthier_alternative: "Phosphate-free detergents",
+  },
+  {
+    name: "Synthetic fragrances in cleaners",
+    concern_level: "medium",
+    why_concerning:
+      "Same undisclosed chemical concerns as in personal care. Volatile organic compounds released into home air.",
+    safety_note: "Ventilate well when using",
+    healthier_alternative:
+      "Fragrance-free cleaners, or those using essential oils",
+  },
+  {
+    name: "2-Butoxyethanol",
+    concern_level: "high",
+    why_concerning:
+      "Found in many multipurpose cleaners. Causes sore throat, narcosis, liver and kidney damage at high exposure.",
+    safety_note: "Not required to be listed on labels in India",
+    healthier_alternative: "Vinegar-based cleaners",
+  },
+];
+
+// ============================================================================
+// 8. COMPACT REFERENCE BUILDER  (performance-critical)
+// ============================================================================
+// Everything above carries multi-sentence why_banned / health_effects_detailed
+// / who_should_avoid / how_to_identify prose. Stringified whole it is ~50k
+// tokens, and it was being sent on EVERY /api/analyze call regardless of what
+// kind of product was scanned.
+//
+// Claude does not need the prose to do the route's job — it needs just enough
+// to IDENTIFY an ingredient on a label and CLASSIFY it. The long explanations
+// are re-attached locally afterwards by lib/enrich-analysis.ts, so the user
+// still sees them; they just aren't regenerated by the API every time.
+//
+// buildCompactReference(category) returns a MINIMAL, category-scoped slice:
+//   banned ingredients  -> { name, also_known_as?, e_code?, severity }
+//   harmful additives   -> { name, e_code?, ins_code?, concern_level, fssai_max_limit_mg_per_kg? }
+//   FSSAI limits        -> name/codes + the limit numbers only (no prose)
+//   Legal Metrology     -> { declaration, requirement }  (names + one-liners, no penalty/details text)
+// A food scan never receives the personal-care or household lists, and vice
+// versa. This drops the reference payload to well under 6k tokens.
+
+export type CompactReferenceCategory =
+  | "food_and_beverages"
+  | "personal_care"
+  | "household_cleaning"
+  | "baby_product_food"
+  | "baby_product_care"
+  | "unknown";
+
+/**
+ * Map any loose category string — including the Haiku router's
+ * 'not_a_packaged_product' — onto one of the known buckets.
+ */
+export function normalizeCompactCategory(v: string): CompactReferenceCategory {
+  const s = (v || "").toLowerCase().trim().replace(/[\s-]+/g, "_");
+  if (
+    s === "food_and_beverages" ||
+    s === "personal_care" ||
+    s === "household_cleaning" ||
+    s === "baby_product_food" ||
+    s === "baby_product_care"
+  ) {
+    return s;
+  }
+  if (
+    s.includes("baby") &&
+    (s.includes("care") ||
+      s.includes("cosmetic") ||
+      s.includes("lotion") ||
+      s.includes("oil") ||
+      s.includes("wash") ||
+      s.includes("powder"))
+  ) {
+    return "baby_product_care";
+  }
+  if (s.includes("baby") || s.includes("infant")) return "baby_product_food";
+  if (
+    s.includes("household") ||
+    s.includes("cleaning") ||
+    s.includes("cleaner") ||
+    s.includes("detergent")
+  ) {
+    return "household_cleaning";
+  }
+  if (s.includes("personal") || s.includes("cosmetic") || s.includes("care"))
+    return "personal_care";
+  if (s.includes("food") || s.includes("beverage") || s.includes("drink"))
+    return "food_and_beverages";
+  return "unknown";
+}
+
+export interface CompactReference {
+  category: CompactReferenceCategory;
+  regulatory: {
+    regulatory_body: string;
+    act: string;
+    complaint_portal: string;
+    required_labels: string[];
+    additional_checks: string[];
+  };
+  banned_ingredients: {
+    name: string;
+    severity: string;
+    also_known_as?: string[];
+    e_code?: string | null;
+  }[];
+  harmful_additives: {
+    name: string;
+    concern_level: string;
+    e_code?: string | null;
+    ins_code?: string | null;
+    fssai_max_limit_mg_per_kg?: number | null;
+  }[];
+  fssai_limits?: {
+    name: string;
+    also_known_as: string[];
+    e_code: string | null;
+    ins_code: string | null;
+    category: string;
+    fssai_max_limit_mg_per_kg: number | null;
+    special_limits: { category: string; limit_mg_per_kg: number }[];
+    adi_mg_per_kg_body_weight: number | null;
+  }[];
+  legal_metrology?: { declaration: string; requirement: string }[];
+  labelling_rules?: string[];
+  household_safety?: { name: string; concern_level: string; safety_note: string }[];
+  stricter_thresholds_note?: string;
+}
+
+export function buildCompactReference(category: string): CompactReference {
+  const cat = normalizeCompactCategory(category);
+  // 'unknown' is treated as a food scan for reference purposes — that list is
+  // the broadest and the Legal Metrology rules apply to every packaged good.
+  const foodSide =
+    cat === "food_and_beverages" ||
+    cat === "baby_product_food" ||
+    cat === "unknown";
+  const careSide = cat === "personal_care" || cat === "baby_product_care";
+  const household = cat === "household_cleaning";
+  const baby = cat === "baby_product_food" || cat === "baby_product_care";
+
+  // Every category (baby ones included) now has its own rule block; only the
+  // 'unknown' bucket has to borrow one.
+  const rulesKey = cat === "unknown" ? "food_and_beverages" : cat;
+  const rule =
+    PRODUCT_CATEGORY_RULES[rulesKey] ?? PRODUCT_CATEGORY_RULES.food_and_beverages;
+
+  const out: CompactReference = {
+    category: cat,
+    regulatory: {
+      regulatory_body: rule.regulatory_body,
+      act: rule.act,
+      complaint_portal: rule.complaint_portal,
+      required_labels: rule.required_labels,
+      additional_checks: rule.additional_checks,
+    },
+    banned_ingredients: [],
+    harmful_additives: [],
+  };
+
+  if (foodSide) {
+    out.banned_ingredients = BANNED_INGREDIENTS.map((b) => ({
+      name: b.name,
+      also_known_as: b.also_known_as,
+      e_code: b.e_code,
+      severity: b.severity,
+    }));
+    out.harmful_additives = HARMFUL_ADDITIVES.map((a) => ({
+      name: a.name,
+      e_code: a.e_code,
+      ins_code: a.ins_code,
+      concern_level: a.concern_level,
+      fssai_max_limit_mg_per_kg: a.max_limit_in_india_mg_per_kg,
+    }));
+    out.fssai_limits = FSSAI_ADDITIVE_LIMITS.map((l) => ({
+      name: l.name,
+      also_known_as: l.also_known_as,
+      e_code: l.e_code,
+      ins_code: l.ins_code,
+      category: l.category,
+      fssai_max_limit_mg_per_kg: l.fssai_max_limit_mg_per_kg,
+      special_limits: l.special_limits,
+      adi_mg_per_kg_body_weight: l.adi_mg_per_kg_body_weight ?? null,
+    }));
+    out.legal_metrology = Object.entries(
+      LEGAL_METROLOGY_RULES.MANDATORY_DECLARATIONS,
+    ).map(([declaration, d]) => ({
+      declaration,
+      requirement: d.requirement,
+    }));
+  }
+
+  if (careSide) {
+    out.banned_ingredients = PERSONAL_CARE_BANNED_INGREDIENTS.map((b) => ({
+      name: b.name,
+      severity: b.severity,
+    }));
+    out.harmful_additives = PERSONAL_CARE_HARMFUL_ADDITIVES.map((a) => ({
+      name: a.name,
+      concern_level: a.concern_level,
+    }));
+    out.labelling_rules = rule.required_labels;
+  }
+
+  if (household) {
+    out.household_safety = HOUSEHOLD_PRODUCT_SAFETY.map((h) => ({
+      name: h.name,
+      concern_level: h.concern_level,
+      safety_note: h.safety_note,
+    }));
+    out.labelling_rules = rule.required_labels;
+  }
+
+  if (baby) {
+    out.stricter_thresholds_note =
+      "BABY PRODUCT — zero tolerance. Flag ANY artificial colour, artificial sweetener or harmful preservative as at least 'harmful' (or 'banned' if it is on a banned list). Flag ANY ingredient with even a 'low' concern level as 'caution'. Apply the stricter of the Indian and EU limits from your own knowledge.";
+  }
+
+  return out;
+}
+

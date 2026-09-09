@@ -1,163 +1,145 @@
 import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
-import { anthropic, CLAUDE_MODEL } from "@/lib/claude";
+import { anthropic, CLAUDE_MODEL, HAIKU_MODEL } from "@/lib/claude";
 import {
-  BANNED_INGREDIENTS,
-  HARMFUL_ADDITIVES,
-  FSSAI_ADDITIVE_LIMITS,
-  LEGAL_METROLOGY_RULES,
-  PRODUCT_CATEGORIES,
-  HEALTHIER_ALTERNATIVES,
-  REFERENCE_METADATA,
+  PRODUCT_CATEGORY_RULES,
+  buildCompactReference,
+  normalizeCompactCategory,
 } from "@/lib/reference-data";
 import { normalizeAnalysis } from "@/lib/analysis-normalize";
-import type { AnalyzeRequestBody, ProductAnalysis } from "@/types/analysis";
+import { enrichAnalysis } from "@/lib/enrich-analysis";
+import type {
+  AnalyzeRequestBody,
+  DetectedCategoryId,
+  ProductAnalysis,
+} from "@/types/analysis";
 
-// Analysis can take 20–40s for a busy label; give Vercel room.
-// 60 is the Hobby-plan ceiling — raise it if you are on Pro and still see cutoffs.
+// The Sonnet analysis can take 20-40s for a busy label; give Vercel room.
+// 60 is the Vercel Hobby-plan cap for `maxDuration` — raise it only on Pro.
 export const maxDuration = 60;
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 /**
- * Output ceiling. Measured against this prompt's response contract: the fixed
- * overhead (11 compliance entries + 15 banned-list checks + product_info +
- * overall_assessment) is ~920 tokens, and each flagged ingredient echoing the
- * reference text costs ~280. A heavily-additive product (8 flagged, 20 total
- * ingredients) lands near 4,400 tokens, so anything at or below 4,096 truncates
- * the JSON on exactly the products this app exists to scrutinise. The
- * dosage_analysis block adds ~500-800 tokens on such a product (one limit_check
- * per additive plus counts and warnings), for a worst case near 5,200. 8,000
- * halves the worst-case generation time versus the previous 16,000 while
- * keeping ~1.5x headroom over that measured worst case.
+ * Output ceiling. The response contract is tight — flagged ingredients return
+ * only { name, safety_status, source, reason } (the long explanations are
+ * re-attached locally by lib/enrich-analysis.ts), banned_ingredients_check
+ * returns only the ingredients actually detected, and the summary is capped at
+ * 3 sentences.
+ *
+ * Measured with THINKING_OFF below: a personal-care label lands ~2,500 output
+ * tokens and a heavily-additive food label ~3,400. 3,000 truncated the food
+ * case mid-JSON (stop_reason "max_tokens" -> unparseable), so this is 4,000:
+ * ~1.2x headroom over the worst case measured, still well inside `maxDuration`.
  */
-const MAX_OUTPUT_TOKENS = 8000;
+const MAX_OUTPUT_TOKENS = 4000;
 
-/** The reference knowledge base, embedded verbatim in the system prompt. */
-const REFERENCE_DATA_BLOCK = [
-  "===== BANNED_INGREDIENTS (prohibited in India — any match MUST be marked 'banned') =====",
-  JSON.stringify(BANNED_INGREDIENTS),
-  "",
-  "===== HARMFUL_ADDITIVES (legal in India but of concern — map concern_level: high->'harmful', medium/low->'caution') =====",
-  JSON.stringify(HARMFUL_ADDITIVES),
-  "",
-  "===== FSSAI_ADDITIVE_LIMITS (FSSAI prescribed maximum levels — basis for dosage_analysis; fssai_max_limit_mg_per_kg null = GMP/no fixed number) =====",
-  JSON.stringify(FSSAI_ADDITIVE_LIMITS),
-  "",
-  "===== LEGAL_METROLOGY_RULES (basis for legal_metrology_compliance) =====",
-  JSON.stringify(LEGAL_METROLOGY_RULES),
-  "",
-  "===== HEALTHIER_ALTERNATIVES (use for the healthier_alternative field) =====",
-  JSON.stringify(HEALTHIER_ALTERNATIVES),
-  "",
-  "===== PRODUCT_CATEGORIES =====",
-  JSON.stringify(PRODUCT_CATEGORIES),
-  "",
-  "===== REFERENCE_METADATA =====",
-  JSON.stringify(REFERENCE_METADATA),
-].join("\n");
+/**
+ * Extended thinking is ON BY DEFAULT for claude-sonnet-5, and its thinking
+ * tokens are drawn from the SAME max_tokens budget as the answer. With it on,
+ * every analysis burned the whole budget on a thinking block and returned
+ * either truncated JSON or no text block at all — a hard 502 on every scan.
+ *
+ * This task is schema-constrained extraction against a reference table supplied
+ * in the prompt, not open-ended reasoning, so thinking buys nothing here while
+ * costing ~2,500 extra output tokens and ~10s of latency per scan. Turn it off
+ * explicitly rather than relying on the model default.
+ */
+const THINKING_OFF = { type: "disabled" } as const;
 
-const SYSTEM_PROMPT = `You are an expert food safety analyst for Indian consumers, with deep knowledge of FSSAI regulations, the Legal Metrology (Packaged Commodities) Rules 2011, and international food-safety databases (EU/EFSA, US FDA, WHO/IARC, Codex). Use the EXACT reference data below for your analysis.
+/**
+ * STEP A router prompt. Haiku is cheap and fast — it only names the product
+ * category so STEP B can be handed a category-scoped compact reference instead
+ * of the entire knowledge base.
+ */
+const CATEGORY_ROUTER_SYSTEM = `Identify the product category from this text extracted from a photo. Return ONLY minified JSON:
+{"category":"food_and_beverages"|"personal_care"|"household_cleaning"|"baby_product_food"|"baby_product_care"|"not_a_packaged_product"|"unknown","confidence":"high"|"medium"|"low","signals":string[],"detected":string}
 
-Before analyzing, verify the text looks like real product packaging. If the text appears garbled or nonsensical (random characters, no recognisable words, OCR noise with no structure), respond with ONLY this JSON object and nothing else:
+Use category "not_a_packaged_product" when ANY of these hold:
+- there is no printed label text at all, or fewer than 15 meaningful words
+- the text describes loose produce, fresh fruit or vegetables, an unwrapped or home-made item, a person, a scene, a handwritten note, or anything that is not a manufactured labelled package
+- there is no MRP, no ingredients list, no manufacturer, no dates and no barcode anywhere in the text
+"detected" = a short plain-language guess at what the photo actually shows (e.g. "a fresh apple", "loose vegetables", "an unpackaged item", "a person", "a printed page"). For a real package set "detected" to "".
+signals = up to 6 short words or phrases from the text that decided it. No prose, no code fences.`;
+
+/**
+ * STEP B system prompt — block 1 of 2. Fully static, so it caches once for
+ * every scan regardless of category. The category-scoped compact reference is
+ * block 2 (built per request in the handler) and caches per category.
+ */
+const STATIC_SYSTEM = `You are an expert product-safety analyst for Indian consumers, with deep knowledge of FSSAI regulations, the Legal Metrology (Packaged Commodities) Rules 2011, the Drugs and Cosmetics Act 1940, BIS standards, and international safety databases (EU/EFSA, US FDA, WHO/IARC, Codex). Use the COMPACT REFERENCE DATA in the second system block for identification and classification.
+
+Before analysing, verify the text looks like real product packaging. If it is garbled or nonsensical (random characters, OCR noise with no structure), respond with ONLY this JSON and nothing else:
 { "error": "garbled_text", "message": "The extracted text appears corrupted", "recommendation": "Please retake the photo" }
-Only proceed with the full analysis described below if the text is reasonably coherent.
 
-For every ingredient you flag:
-- Include the detailed 'why_banned' or 'why_concerning' explanation from the reference data so the consumer understands the reason.
-- Include the detailed 'health_effects_detailed' so the consumer knows what it does to their body.
-- Include 'who_should_avoid' information.
-- Include which countries have banned/restricted it.
-- Include the healthier alternative.
+The product category has ALREADY been identified — see "ACTIVE CATEGORY" and the COMPACT REFERENCE DATA in the second system block. Do NOT re-derive it. Analyse the product strictly under that category's rules and set detected_category.category to the ACTIVE CATEGORY value.
 
-CRITICAL RULES:
-- If an ingredient matches BANNED_INGREDIENTS -> mark as 'banned', include full why_banned and health_effects_detailed.
-- If an ingredient matches HARMFUL_ADDITIVES -> mark based on concern_level (high -> 'harmful', medium -> 'caution', low -> 'caution'), include full health_effects_detailed and why_concerning.
-- If an ingredient is NOT in either list but you know from your training data that it is harmful, banned in other countries, or has documented health concerns -> STILL FLAG IT as 'caution' or 'harmful' with your explanation. Our lists are comprehensive but may not cover everything.
-- Specifically check for COMBINATIONS — e.g. Sodium Benzoate (or any benzoate: E210-E213) together with Vitamin C / Ascorbic Acid (E300) in the same product = benzene risk. Flag the combination explicitly as its own ingredient_analysis entry.
-- For ingredients you're uncertain about, mark as 'unknown' and note what is known.
-- Check against EU, US FDA, WHO/IARC, and other international databases from your knowledge.
-- Set 'source' to 'reference_database' when the finding comes from the provided lists, or 'ai_knowledge' when it comes from your own training.
-- Also return a field 'ingredients_not_in_database' for any ingredients you flagged from your own knowledge that weren't in the provided lists — so we can update our database.
+ANTI-HALLUCINATION — DO NOT INVENT WHAT YOU CANNOT SEE:
+NEVER produce a compliance verdict, safety score, or violation list for information that is not actually present in the extracted text.
+- A mandatory declaration that is not in the text because the text is incomplete or only part of the pack was photographed => status: "not_visible", NOT "missing". "missing" means the label is legible and the declaration is genuinely absent; "not_visible" means you cannot tell.
+- If MORE THAN 3 declarations are "not_visible", do NOT return a compliance score: set overall_assessment.compliance_score to null and overall_assessment.compliance_status to "insufficient_data".
+- If NO ingredients were found in the text, do NOT return a safety score: set overall_assessment.safety_score to null and overall_assessment.safety_status to "insufficient_data", and return ingredient_analysis as [].
+- Never infer a product's identity from packaging colours or style. If the brand or product name is not legible in the text, set product_info.name (and brand) to null. NEVER return a guessed name, and NEVER put a hedge or disclaimer inside the name field (no "inferred from…", no "(not confirmed)").
+- When you can see enough to score normally, set safety_status and compliance_status to "ok".
 
-DOSAGE AND LIMIT CHECKING:
-For each additive found in the ingredients list:
-1. Check if it has a prescribed FSSAI limit from the FSSAI_ADDITIVE_LIMITS reference (match on name, also_known_as, e_code or ins_code). Use the special_limits entry for this product's category where one applies, otherwise fssai_max_limit_mg_per_kg. A null limit means the additive is permitted at GMP — there is no fixed number, so heavy or prominent use is the concern.
-2. Look at the nutritional information and label declarations for any quantity declaration for that additive (e.g. "Contains permitted class II preservative (INS 211) 150 mg/kg", "Added colour 100 mg/kg").
-3. If the product label declares the quantity of an additive, compare it to the FSSAI limit for that product category and set status to 'within_limit' or 'exceeds_limit'. Put the numbers in 'note'.
-4. If the label does NOT declare the quantity (which is common), set status to 'quantity_not_declared' and note "unable to verify — quantity not declared on label".
-5. If multiple preservatives or multiple colours are present, add a combination_warnings entry: "This product uses X different preservatives/colours. While each may be within individual limits, the COMBINED load increases health risk. FSSAI limits are per-additive, but cumulative exposure is a growing concern." Also flag benzoate (E210-E213) together with ascorbic acid / vitamin C (E300) as a benzene-formation risk.
-6. Calculate an approximate safe daily intake where possible: for an additive with an ADI (adi_mg_per_kg_body_weight) at concentration C mg/kg or mg/l, a 60 kg adult's daily allowance is 60 x ADI mg; divide by C to get the kg or litres of product that reaches the ADI, and express it as servings (assume a 600 ml bottle / 250 ml glass for drinks, a 50 g pack for snacks) in 'daily_intake_warning'. If no ADI or no concentration is available, set daily_intake_warning to null.
+CATEGORY-SPECIFIC RULES:
+- food_and_beverages / baby_product_food: check ingredients against banned_ingredients, harmful_additives and fssai_limits; check Legal Metrology + the FSSAI food labels; verify the 14-digit FSSAI licence format; flag allergens. Complaint portal: FSSAI Food Safety Connect.
+- personal_care / baby_product_care: check against the (cosmetic) banned_ingredients and harmful_additives lists. Do NOT flag ordinary cosmetic ingredients as 'harmful' — SLS/SLES in a wash-off product is 'caution', not 'harmful'; reserve 'harmful' for genuine dermal-absorption dangers. FSSAI licence / veg-nonveg / nutrition table are NOT applicable — mark those declarations present:false, compliant:true, issue:"Not applicable to personal care products". Complaint portal: CDSCO consumer corner + National Consumer Helpline.
+- household_cleaning: check against household_safety and surface each safety_note (ventilation, do-not-mix-with-bleach/ammonia). Treat a missing 'keep out of reach of children' warning or missing first-aid instructions as compliance issues. FSSAI / nutrition / veg-nonveg NOT applicable. Complaint portal: National Consumer Helpline + BIS.
+- baby_product_*: apply stricter_thresholds_note — zero tolerance for artificial colours, artificial sweeteners and harmful preservatives; flag even 'low' concern ingredients as 'caution'.
+
+SAME INGREDIENT, DIFFERENT RATING BY CATEGORY (deliberate): Sodium Lauryl Sulfate in a SHAMPOO => 'caution'; in FOOD => 'harmful'. Tartrazine / synthetic dye in FOOD => 'harmful' (ingested, Southampton Six); in a rinse-off SHAMPOO => 'caution'. Judge every ingredient in the context of the ACTIVE CATEGORY.
+
+INGREDIENT OUTPUT — KEEP IT SHORT:
+For an ingredient you recognise from the COMPACT REFERENCE DATA: set source to 'reference_database' and return only { name, safety_status, reason (ONE line, <= 20 words), source, personal_flags }. Leave health_effects "", who_should_avoid "", banned_in_countries [], healthier_alternative "" — the server fills those from its local database. Do NOT write long explanations for these.
+For an ingredient NOT in the reference data that you know from your own training to be harmful, restricted, or of documented concern: STILL flag it, set source to 'ai_knowledge', and THEN write the full health_effects, who_should_avoid, banned_in_countries and healthier_alternative yourself.
+Mapping: any match in banned_ingredients -> 'banned'. harmful_additives concern_level high -> 'harmful' (food) / 'caution' (personal care unless egregious), medium or low -> 'caution'. Uncertain -> 'unknown'.
+Check explicitly for a benzoate (E210-E213) together with ascorbic acid / vitamin C (E300) -> benzene risk; emit it as its own ingredient_analysis entry.
+Also return 'ingredients_not_in_database' for every ingredient you flagged from your own knowledge.
+
+DOSAGE AND LIMIT CHECKING (food categories only — for personal_care / household_cleaning return additive_count zeroed, limit_checks [], cumulative_risk 'low', daily_intake_warning null, combination_warnings []):
+For each additive in the ingredients list, match it against fssai_limits (name / also_known_as / e_code / ins_code) and use the special_limits entry for this product type where one applies, otherwise fssai_max_limit_mg_per_kg (null = permitted at GMP). If the label declares a quantity, compare and set 'within_limit' / 'exceeds_limit'; otherwise 'quantity_not_declared'. Add a combination_warnings entry when several preservatives or several colours are present, or for benzoate + ascorbic acid. Where an ADI and a declared or estimable concentration exist, compute how much of the product a 60 kg adult can safely have per day and put it in daily_intake_warning (assume a 600 ml bottle / 250 ml glass for drinks, a 50 g pack for snacks); otherwise null.
 
 USER PERSONAL HEALTH PROFILE:
-If — and only if — a "USER PERSONAL HEALTH PROFILE" section is present in the user message, the user has the following dietary criteria and health conditions. Flag ANY ingredient that conflicts with their profile, even if the ingredient is otherwise safe for the general population.
-
-The section lists, when set:
-Allergies: [list]
-Dietary preferences: [list]
-Health conditions: [list]
-Custom ingredients to avoid: [list]
-
-For each ingredient, populate the 'personal_flags' field — an array of objects: { reason: string, severity: 'critical' | 'warning' | 'info' }. Leave it as [] when the ingredient does not conflict with the profile, and [] for EVERY ingredient when no profile section is present.
-
-Examples:
-- User is allergic to nuts -> ingredient contains 'almond extract' -> personal_flag: { reason: 'Contains tree nut derivative — you listed nut allergy', severity: 'critical' }
-- User selected 'no sugar' -> ingredient is 'sugar' or 'sucrose' or 'dextrose' -> personal_flag: { reason: 'Contains sugar — conflicts with your no-sugar preference', severity: 'warning' }
-- User is diabetic -> ingredient is 'high fructose corn syrup' -> personal_flag: { reason: 'High glycemic ingredient — risky for diabetic condition', severity: 'critical' }
-- User selected 'no artificial colors' -> ingredient is 'Tartrazine' -> personal_flag: { reason: 'Artificial color — conflicts with your preference', severity: 'warning' }
-- User is pregnant -> ingredient is 'Aspartame' -> personal_flag: { reason: 'Artificial sweetener — consult your doctor during pregnancy', severity: 'warning' }
-- User has hypertension -> product has high sodium -> personal_flag: { reason: 'High sodium content — risky with hypertension', severity: 'critical' }
-- User wants to avoid 'palm oil' -> ingredient contains palm oil -> personal_flag: { reason: 'Contains palm oil — you chose to avoid this', severity: 'warning' }
-- User has ADHD child -> product contains Southampton Six dyes -> personal_flag: { reason: 'Contains dye linked to hyperactivity in children', severity: 'critical' }
-- User has PKU -> product contains Aspartame -> personal_flag: { reason: 'Contains phenylalanine — DANGEROUS for PKU', severity: 'critical' }
-
-Severity guide:
-- critical: allergen present, or ingredient is medically dangerous for their condition
-- warning: conflicts with a dietary preference or is concerning for their condition
-- info: mild relevance, worth noting
-
-Also return a top-level 'personal_alerts' array of { ingredient: string|null, reason: string, severity: 'critical' | 'warning' | 'info' } for profile conflicts that concern the WHOLE product rather than one named ingredient (e.g. overall high sodium/sugar/fat content vs a condition or preference). Use ingredient: null for those. Use [] when there is no profile or no product-level conflict. Do NOT duplicate an ingredient-level personal_flag here.
-
-If the user has no health profile set (no profile section in the user message), skip all of the above: 'personal_flags' is [] on every ingredient and 'personal_alerts' is [].
+If — and only if — a "USER PERSONAL HEALTH PROFILE" section is present in the user message, flag ANY ingredient that conflicts with it, even if the ingredient is otherwise safe. Populate each ingredient's 'personal_flags' array with { reason, severity: 'critical' | 'warning' | 'info' } ([] when no conflict, [] for EVERY ingredient when no profile is present). Also return a top-level 'personal_alerts' array of { ingredient: string|null, reason, severity } for whole-product conflicts (e.g. overall high sodium vs hypertension); use ingredient: null for those and do not duplicate an ingredient-level flag. Severity: critical = allergen present or medically dangerous; warning = conflicts with a preference or concerning for a condition; info = mild relevance.
 
 Return ONLY a single valid JSON object (no markdown, no code fences, no text outside the JSON) with EXACTLY these keys:
 
-1. product_info: { name, brand, category, net_weight, mrp, manufacture_date, expiry_date, manufacturer_address, fssai_license, batch_number, customer_care, country_of_origin } — use null for anything not found. 'category' should be one of the PRODUCT_CATEGORIES ids where possible.
+1. product_info: { name, brand, category, net_weight, mrp, manufacture_date, expiry_date, manufacturer_address, fssai_license, batch_number, customer_care, country_of_origin } — null for anything not found.
 
-2. legal_metrology_compliance: an object with one key per mandatory declaration in LEGAL_METROLOGY_RULES.MANDATORY_DECLARATIONS (manufacturer_info, generic_name, net_quantity, manufacture_date, best_before_use_by, mrp, unit_sale_price, consumer_care, country_of_origin, fssai_license, dimensions_if_applicable). For each: { present: boolean, value: string|null, compliant: boolean, issue: string|null }. Use each rule's 'details' text to judge 'compliant' and to write 'issue'. For country_of_origin and dimensions_if_applicable, if not applicable to this product set present=false, compliant=true, issue="Not applicable".
+2. legal_metrology_compliance: an object with one key per mandatory declaration (manufacturer_info, generic_name, net_quantity, manufacture_date, best_before_use_by, mrp, unit_sale_price, consumer_care, country_of_origin, fssai_license, dimensions_if_applicable). For each: { present: boolean, value: string|null, compliant: boolean, issue: string|null, status: "present"|"missing"|"not_visible"|"not_applicable" }. Use "not_visible" per the ANTI-HALLUCINATION rules — only use "missing" when the label is legible and the declaration is truly absent. For a declaration not applicable to the ACTIVE CATEGORY set present:false, compliant:true, status:"not_applicable", issue:"Not applicable to <category> products".
 
-3. ingredient_analysis: an array; for EACH ingredient found in the text:
-   {
-     name: string,
-     safety_status: 'safe' | 'caution' | 'harmful' | 'banned' | 'unknown',
-     reason: string,                 // plain-language WHY (from reference data or your knowledge)
-     health_effects: string,         // plain-language what it does to the human body
-     who_should_avoid: string,       // specific higher-risk groups (children, pregnant women, asthmatics, elderly, etc.)
-     banned_in_countries: string[],  // countries/regions that ban or restrict it (empty array if none)
-     healthier_alternative: string,  // what to use instead
-     source: 'reference_database' | 'ai_knowledge',
-     personal_flags: array of { reason: string, severity: 'critical' | 'warning' | 'info' }  // conflicts with the USER PERSONAL HEALTH PROFILE; [] if none or no profile
-   }
+3. ingredient_analysis: an array, one entry per ingredient found in the text:
+   { name, safety_status: 'safe'|'caution'|'harmful'|'banned'|'unknown', reason (one line), health_effects, who_should_avoid, banned_in_countries (string[]), healthier_alternative, source: 'reference_database'|'ai_knowledge', personal_flags: array of { reason, severity } }.
+   Per "KEEP IT SHORT" above, the four long fields stay empty for 'reference_database' ingredients.
 
-4. overall_assessment: { safety_score: 0-100, compliance_score: 0-100, summary: string, recommendation: string (should the user consume this?) }
+4. overall_assessment: { safety_score: 0-100 or null, compliance_score: 0-100 or null, safety_status: "ok"|"insufficient_data", compliance_status: "ok"|"insufficient_data", summary: string (MAX 3 sentences — this is shown only inside a collapsed "Full assessment" section, so it does not need to lead), recommendation: string }. Per the ANTI-HALLUCINATION rules, a score is null exactly when its status is "insufficient_data".
 
-5. banned_ingredients_check: an array; explicitly check the product against the FSSAI banned list (every entry in BANNED_INGREDIENTS — Potassium Bromate, Brominated Vegetable Oil, Metanil Yellow, Rhodamine B, Sudan dyes, Calcium Carbide, Formalin, Oxytocin, Malachite Green, Lead Chromate, Copper Sulphate, Argemone, Toluene in packaging, stapler pins in tea bags, Titanium Dioxide). For each: { ingredient: string, detected: boolean, notes: string|null }.
+4a. verdict: one of 'safe' | 'caution' | 'avoid' — the single top-line call the user sees first. 'safe' roughly maps to safety_score >= 75 with no harmful/banned ingredients; 'avoid' to any banned ingredient, a serious personal_alert, or safety_score < 50; 'caution' otherwise. If safety_status is "insufficient_data", still give your best-judgement verdict from what you could read.
 
-6. ingredients_not_in_database: an array of { name: string, why_flagged: string, suggested_status: 'safe' | 'caution' | 'harmful' | 'banned' | 'unknown' } for ingredients you flagged from your own knowledge that were absent from the provided lists. Use [] if none.
+4b. verdict_reason: ONE plain sentence backing the verdict, MAXIMUM 20 words. No lists, no semicolons.
 
-7. dosage_analysis: {
-     additive_count: { preservatives: number, colors: number, sweeteners: number, antioxidants: number, emulsifiers: number, flavor_enhancers: number, total: number } — count every additive of each kind found in the ingredients list,
-     limit_checks: array of { name: string, fssai_limit: string|null (the applicable FSSAI maximum as text, e.g. "200 mg/kg (beverages)"), declared_quantity_if_available: string|null, status: 'within_limit' | 'exceeds_limit' | 'quantity_not_declared', note: string|null },
-     cumulative_risk: 'low' | 'medium' | 'high' — based on the total number of additives and their concern levels (few, low-concern additives = low; several or any high-concern = medium; many additives or an exceeded limit or a dangerous combination = high),
-     daily_intake_warning: string|null — how much of this product a 60 kg adult can safely consume per day, per rule 6 above; null if not calculable,
-     combination_warnings: string[] — one entry per dangerous combination (multiple preservatives, multiple colours, benzoate + ascorbic acid, …); [] if none
-   }
+4c. key_findings: an array of 2 to 4 short strings — the most important things the user should know, each UNDER 12 words, each a single line, no trailing punctuation. Examples: "Contains 2 harmful additives", "Missing net quantity declaration", "High sugar: 68g per 100g", "No banned ingredients found". Order most-important first.
 
-8. personal_alerts: array of { ingredient: string|null, reason: string, severity: 'critical' | 'warning' | 'info' } — product-level conflicts with the USER PERSONAL HEALTH PROFILE (see the USER PERSONAL HEALTH PROFILE section above). [] when there is no profile or no product-level conflict.
+5. banned_ingredients_check: an array containing ONLY the banned-list ingredients you ACTUALLY detected in this product — { ingredient: string, detected: true, notes: string|null }. Return [] if none are present. Do NOT emit an entry for banned items that are absent.
 
-If the text is too garbled or sparse to identify a product, still return the full JSON structure with best-effort nulls, empty arrays, zeroed additive_count, cumulative_risk 'low', personal_flags [] on every ingredient, personal_alerts [], and a summary explaining that the text could not be reliably read.
+6. ingredients_not_in_database: array of { name, why_flagged, suggested_status } for ingredients you flagged from your own knowledge that were absent from the reference data. [] if none.
 
-${REFERENCE_DATA_BLOCK}`;
+7. dosage_analysis: { additive_count: { preservatives, colors, sweeteners, antioxidants, emulsifiers, flavor_enhancers, total }, limit_checks: array of { name, fssai_limit: string|null, declared_quantity_if_available: string|null, status: 'within_limit'|'exceeds_limit'|'quantity_not_declared', note: string|null }, cumulative_risk: 'low'|'medium'|'high', daily_intake_warning: string|null, combination_warnings: string[] }.
+
+8. personal_alerts: array of { ingredient: string|null, reason, severity: 'critical'|'warning'|'info' } — product-level profile conflicts; [] when there is no profile or no conflict.
+
+9. detected_category: { category: the ACTIVE CATEGORY value, confidence: 'high'|'medium'|'low', signals_found: string[], regulatory_body: string, applicable_act: string, complaint_portal: string } — take regulatory_body / applicable_act / complaint_portal from the ACTIVE CATEGORY block.
+
+If the text is too garbled or sparse to identify a product, still return the full JSON structure with best-effort nulls, empty arrays, zeroed additive_count, cumulative_risk 'low', empty personal_flags/personal_alerts, safety_score null + safety_status "insufficient_data", compliance_score null + compliance_status "insufficient_data", verdict 'caution', verdict_reason "Not enough of the label was readable to judge this product.", key_findings ["Only part of the label could be read"], detected_category with the ACTIVE CATEGORY value and confidence 'low', and a summary explaining the text could not be reliably read.`;
+
+const VALID_CATEGORY_OVERRIDES: DetectedCategoryId[] = [
+  "food_and_beverages",
+  "personal_care",
+  "household_cleaning",
+  "baby_product_food",
+  "baby_product_care",
+];
 
 function jsonError(message: string, status: number, extra?: Record<string, unknown>) {
   return NextResponse.json({ error: message, ...extra }, { status });
@@ -198,7 +180,7 @@ function extractJson(raw: string): unknown {
 /**
  * Render the optional user health profile as the "USER PERSONAL HEALTH PROFILE"
  * block appended to the user message. Returns "" when no profile / no criteria,
- * so the cached system prompt never changes shape between callers.
+ * so the cached system blocks never change shape between callers.
  */
 function formatHealthProfile(raw: unknown): string {
   if (!raw || typeof raw !== "object") return "";
@@ -235,6 +217,55 @@ function formatHealthProfile(raw: unknown): string {
   ].join("\n");
 }
 
+/**
+ * STEP A — cheap category routing with Haiku. Costs almost nothing (max 200
+ * output tokens, no reference data). Any failure degrades to 'unknown', which
+ * STEP B treats as a food scan.
+ */
+async function routeCategory(text: string): Promise<{
+  category: string;
+  confidence: "high" | "medium" | "low";
+  signals: string[];
+  detected: string;
+}> {
+  try {
+    const msg = await anthropic.messages.create({
+      model: HAIKU_MODEL,
+      max_tokens: 200,
+      system: CATEGORY_ROUTER_SYSTEM,
+      messages: [{ role: "user", content: text.slice(0, 6000) }],
+    });
+    const raw = msg.content
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map((b) => b.text)
+      .join("");
+    const parsed = extractJson(raw) as Record<string, unknown>;
+    const conf = String(parsed?.confidence ?? "").toLowerCase();
+    return {
+      category: String(parsed?.category ?? "unknown"),
+      confidence:
+        conf === "high" || conf === "medium" || conf === "low" ? conf : "low",
+      signals: Array.isArray(parsed?.signals)
+        ? parsed.signals
+            .filter((s): s is string => typeof s === "string")
+            .slice(0, 6)
+        : [],
+      detected: typeof parsed?.detected === "string" ? parsed.detected.trim() : "",
+    };
+  } catch {
+    return { category: "unknown", confidence: "low", signals: [], detected: "" };
+  }
+}
+
+/** Cheap local backstop: near-empty OCR text is never a packaged product. */
+function looksUnanalyzable(text: string): boolean {
+  const words = text.split(/\s+/).filter((w) => /[a-z0-9]/i.test(w));
+  const hasSignal = /(mrp|ingredient|fssai|mfg|batch|net wt|net quantity|₹|rs\.?\s*\d|manufactured|best before|use by)/i.test(
+    text,
+  );
+  return words.length < 8 && !hasSignal;
+}
+
 export async function POST(request: Request) {
   let body: AnalyzeRequestBody;
   try {
@@ -262,6 +293,65 @@ export async function POST(request: Request) {
 
   const healthProfileBlock = formatHealthProfile(body?.userHealthProfile);
 
+  const categoryOverride =
+    typeof body?.categoryOverride === "string" &&
+    (VALID_CATEGORY_OVERRIDES as string[]).includes(body.categoryOverride)
+      ? (body.categoryOverride as DetectedCategoryId)
+      : null;
+
+  // ---- STEP A: route the product to a category (Haiku), or trust the user ----
+  // A category override means the user has explicitly asserted this IS a
+  // package, so the "not a package" gate is skipped for that path.
+  const routed = categoryOverride
+    ? {
+        category: categoryOverride as string,
+        confidence: "high" as const,
+        signals: ["user confirmed the category"],
+        detected: "",
+      }
+    : await routeCategory(extractedText);
+
+  // ---- HARD GATE: not a packaged product -> STOP. Never call Sonnet, never
+  // produce a score. (FIX 1 + FIX 2) ----
+  if (
+    !categoryOverride &&
+    (routed.category === "not_a_packaged_product" ||
+      looksUnanalyzable(extractedText))
+  ) {
+    return NextResponse.json(
+      {
+        error: "not_a_packaged_product",
+        detected: routed.detected || null,
+        message:
+          "We couldn't find any product label in this photo. HealthRepo analyses packaged products — the ingredients list, MRP, dates and manufacturer details printed on the pack.",
+      },
+      { status: 422 },
+    );
+  }
+
+  const activeCategory = normalizeCompactCategory(
+    routed.category === "not_a_packaged_product" ? "unknown" : routed.category,
+  );
+
+  const compactReference = buildCompactReference(activeCategory);
+  // Every category has its own rule block; only 'unknown' borrows one.
+  const rule =
+    PRODUCT_CATEGORY_RULES[
+      activeCategory === "unknown" ? "food_and_beverages" : activeCategory
+    ] ?? PRODUCT_CATEGORY_RULES.food_and_beverages;
+
+  const categoryBlock = [
+    `ACTIVE CATEGORY: ${activeCategory}`,
+    `Regulator: ${rule.regulatory_body}`,
+    `Governing act: ${rule.act}`,
+    `Consumer complaint portal: ${rule.complaint_portal}`,
+    "",
+    `Analyse the product strictly under this category. Set detected_category.category to "${activeCategory}".`,
+    "",
+    "===== COMPACT REFERENCE DATA (already filtered to this category — do not ask for more) =====",
+    JSON.stringify(compactReference),
+  ].join("\n");
+
   let responseText: string;
   let stoppedAtCap = false;
   try {
@@ -272,12 +362,20 @@ export async function POST(request: Request) {
       .stream({
         model: CLAUDE_MODEL,
         max_tokens: MAX_OUTPUT_TOKENS,
-        // The reference-data block is large and static — cache it so repeat
-        // scans only pay full price for it once every few minutes.
+        thinking: THINKING_OFF,
+        // Block 1 is fully static (one cache entry for all scans); block 2 is
+        // the category-scoped compact reference (one entry per category). The
+        // variable OCR text + health profile go in `messages`, never here, so
+        // the cache prefix stays stable.
         system: [
           {
             type: "text",
-            text: SYSTEM_PROMPT,
+            text: STATIC_SYSTEM,
+            cache_control: { type: "ephemeral" },
+          },
+          {
+            type: "text",
+            text: categoryBlock,
             cache_control: { type: "ephemeral" },
           },
         ],
@@ -351,8 +449,40 @@ export async function POST(request: Request) {
       );
     }
 
-    // Normalised, not cast — the client renders this without further guarding.
-    analysis = normalizeAnalysis(parsed);
+    // Normalised, then enriched with the local long-form explanations the model
+    // was told NOT to regenerate (FIX 3). The client renders this unguarded.
+    analysis = enrichAnalysis(normalizeAnalysis(parsed));
+
+    // Additive dosage / FSSAI limit checking is a food-only concept. The prompt
+    // asks for it to be zeroed outside the food categories, but the model
+    // occasionally counts a cosmetic preservative anyway — enforce it here so a
+    // shampoo can never be shown an "additive dosage" verdict.
+    if (activeCategory === "personal_care" || activeCategory === "household_cleaning" || activeCategory === "baby_product_care") {
+      analysis.dosage_analysis = {
+        additive_count: {
+          preservatives: 0, colors: 0, sweeteners: 0, antioxidants: 0,
+          emulsifiers: 0, flavor_enhancers: 0, total: 0,
+        },
+        limit_checks: [],
+        cumulative_risk: "low",
+        daily_intake_warning: null,
+        combination_warnings: [],
+      };
+    }
+
+    // Our routing is authoritative for the category — the model only had to
+    // classify ingredients under it, not re-derive the regulator.
+    analysis.detected_category = {
+      category: activeCategory,
+      confidence: categoryOverride ? "high" : routed.confidence,
+      signals_found:
+        analysis.detected_category.signals_found.length > 0
+          ? analysis.detected_category.signals_found
+          : routed.signals,
+      regulatory_body: rule.regulatory_body,
+      applicable_act: rule.act,
+      complaint_portal: rule.complaint_portal,
+    };
   } catch {
     // Distinguish "ran out of room" from "model returned malformed JSON" —
     // the first is a config problem, the second is a model problem.
@@ -372,5 +502,7 @@ export async function POST(request: Request) {
     analysis,
     imageUrl: body.imageUrl ?? null,
     model: CLAUDE_MODEL,
+    routerModel: HAIKU_MODEL,
+    detectedCategory: activeCategory,
   });
 }

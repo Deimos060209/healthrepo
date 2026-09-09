@@ -7,6 +7,7 @@
  */
 
 import type {
+  DetectedCategory,
   DosageAnalysis,
   IngredientAnalysis,
   LegalMetrologyCompliance,
@@ -40,6 +41,8 @@ export interface ScannedProduct {
   product_name: string;
   brand: string | null;
   category: string | null;
+  /** Broad regulatory category detected by /api/analyze (PHASE 1); null on older rows. */
+  detected_category: DetectedCategory | null;
   image_url: string | null;
   extracted_text: string | null;
   compliance_status: ComplianceStatus | null;

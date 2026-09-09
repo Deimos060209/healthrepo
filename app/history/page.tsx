@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { ProductCardSkeleton } from "@/components/Skeleton";
 import { supabase } from "@/lib/supabase";
+import { useAuth } from "@/components/AuthProvider";
 import { PRODUCT_CATEGORIES } from "@/lib/reference-data";
 import type { ComplianceItem, IngredientAnalysis } from "@/types/analysis";
 
@@ -30,6 +31,12 @@ interface ScanRow {
   scanned_at: string;
 }
 
+/**
+ * loading — waiting on auth or the query
+ * anon    — no signed-in user
+ * ready   — the query SUCCEEDED (rows may still be []; that is EMPTY, not an error)
+ * error   — the query actually failed
+ */
 type LoadState = "loading" | "ready" | "anon" | "error";
 
 const CATEGORY_MAP = new Map(
@@ -86,42 +93,67 @@ const titleCase = (s: string) =>
   s.replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
 export default function HistoryPage() {
+  // Use the resolved AuthProvider session rather than a bare getUser() so the
+  // query never races ahead of auth loading.
+  const { user, loading: authLoading } = useAuth();
   const [state, setState] = useState<LoadState>("loading");
   const [rows, setRows] = useState<ScanRow[]>([]);
+  const [errorDetail, setErrorDetail] = useState<string | null>(null);
   const [category, setCategory] = useState<string>("all");
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
+    if (authLoading) {
+      setState("loading");
+      return;
+    }
+    if (!user) {
+      setState("anon");
+      return;
+    }
+
     let alive = true;
     setState("loading");
+    setErrorDetail(null);
+
     (async () => {
-      const {
-        data: { user },
-      } = await supabase.auth.getUser();
-      if (!alive) return;
-      if (!user) {
-        setState("anon");
-        return;
-      }
-      const { data, error } = await supabase
-        .from("scanned_products")
-        .select(
-          "id, product_name, brand, category, image_url, compliance_status, compliance_details, ingredient_analysis, overall_score, scanned_at",
-        )
-        .eq("user_id", user.id)
-        .order("scanned_at", { ascending: false });
-      if (!alive) return;
-      if (error) {
+      try {
+        const { data, error } = await supabase
+          .from("scanned_products")
+          .select(
+            "id, product_name, brand, category, image_url, compliance_status, compliance_details, ingredient_analysis, overall_score, scanned_at",
+          )
+          .eq("user_id", user.id)
+          .order("scanned_at", { ascending: false });
+        if (!alive) return;
+
+        if (error) {
+          // Surface the true cause (missing table/column, RLS, network…).
+          console.error("[history] scanned_products fetch failed:", error);
+          setErrorDetail(
+            [error.message, error.code && `(${error.code})`, error.hint]
+              .filter(Boolean)
+              .join(" "),
+          );
+          setState("error");
+          return;
+        }
+
+        // A successful query with no rows is EMPTY, not a failure.
+        setRows((data ?? []) as unknown as ScanRow[]);
+        setState("ready");
+      } catch (err) {
+        if (!alive) return;
+        console.error("[history] scanned_products fetch threw:", err);
+        setErrorDetail(err instanceof Error ? err.message : String(err));
         setState("error");
-        return;
       }
-      setRows((data ?? []) as unknown as ScanRow[]);
-      setState("ready");
     })();
+
     return () => {
       alive = false;
     };
-  }, [reloadKey]);
+  }, [user, authLoading, reloadKey]);
 
   const visible = useMemo(
     () =>
@@ -159,6 +191,9 @@ export default function HistoryPage() {
         {state === "error" && (
           <div className="mt-10 flex flex-col items-start gap-3 rounded-2xl border border-red-500/30 bg-red-500/[0.06] p-5 text-sm text-red-700 dark:text-red-300">
             <p>Could not load your scan history.</p>
+            {errorDetail && (
+              <p className="font-mono text-xs opacity-80">{errorDetail}</p>
+            )}
             <button
               type="button"
               onClick={() => setReloadKey((k) => k + 1)}
@@ -181,8 +216,9 @@ export default function HistoryPage() {
         {state === "ready" && rows.length === 0 && (
           <EmptyState
             icon={<Package className="h-10 w-10" aria-hidden />}
-            title="No products scanned yet"
-            body="Start by scanning your first product!"
+            title="No scans yet"
+            body="Scan your first product to start building your history."
+            ctaLabel="Scan a product"
           />
         )}
 
@@ -335,10 +371,12 @@ function EmptyState({
   icon,
   title,
   body,
+  ctaLabel = "Scan Now",
 }: {
   icon: React.ReactNode;
   title: string;
   body: string;
+  ctaLabel?: string;
 }) {
   return (
     <div className="mt-16 flex flex-col items-center gap-3 text-center">
@@ -352,7 +390,7 @@ function EmptyState({
         className="mt-2 inline-flex items-center gap-2 rounded-2xl bg-teal-600 px-6 py-3 text-sm font-semibold text-white shadow-sm shadow-teal-600/30"
       >
         <ScanLine className="h-4 w-4" aria-hidden />
-        Scan Now
+        {ctaLabel}
       </Link>
     </div>
   );

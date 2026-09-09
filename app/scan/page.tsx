@@ -26,6 +26,8 @@ import {
   ArrowRight,
   PencilLine,
   Frown,
+  Package,
+  FileText,
 } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { useToast } from "@/components/ToastProvider";
@@ -38,7 +40,11 @@ import {
 } from "@/lib/ocr";
 import { supabase } from "@/lib/supabase";
 import { uploadProductImage } from "@/lib/storage";
-import { HEALTHIER_ALTERNATIVES, REFERENCE_METADATA } from "@/lib/reference-data";
+import { HEALTHIER_ALTERNATIVES } from "@/lib/reference-data";
+import {
+  resolveCategory,
+  SELECTABLE_CATEGORIES,
+} from "@/lib/product-category";
 import {
   fetchHealthProfile,
   isHealthProfileEmpty,
@@ -50,8 +56,10 @@ import type {
   SafetyStatus,
   DosageAnalysis,
   CumulativeRisk,
+  DetectedCategoryId,
   PersonalFlag,
   PersonalFlagSeverity,
+  Verdict,
 } from "@/types/analysis";
 
 // ---------------------------------------------------------------------------
@@ -61,15 +69,21 @@ import type {
 type View =
   | "capture"
   | "processing"
-  | "verify"
   | "results"
   | "error"
   | "garbled"
+  | "notpackaged"
   | "unreadable"
   | "manual";
-type VerifyChoice = "analyze" | "vision" | "auto";
 /** Which rung of the three-tier extraction chain produced the analysed text. */
 type Tier = "tesseract" | "haiku" | "sonnet" | "manual";
+
+/** Human label for how the analysed text was obtained. */
+function readByLabel(tier: Tier): string {
+  if (tier === "tesseract") return "on-device OCR";
+  if (tier === "manual") return "your entry";
+  return "AI vision";
+}
 type StepState = "idle" | "active" | "done";
 type StepKey = "ocr" | "verify" | "enhance" | "advanced" | "analyze" | "report";
 type Steps = Record<StepKey, StepState>;
@@ -93,6 +107,11 @@ function buildManualText(m: ManualForm): string {
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+/** Clamp a model-supplied safety score into a 0-100 integer (0 when absent). */
+function clampScore(n: number | null | undefined): number {
+  return Math.max(0, Math.min(100, Math.round(n ?? 0)));
 }
 
 const TIER_LABEL: Record<Tier, { label: string; note: string }> = {
@@ -132,6 +151,40 @@ const IMAGE_TIPS = [
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// FIX 6 — never pay for the same analysis twice. A short-lived in-memory cache
+// of successful analyses keyed by the extracted text (+ whether a health
+// profile was applied). A repeat scan of the same label inside the window — a
+// double-tap, or a retry after a save error — reuses the result instead of
+// making another billed /api/analyze call.
+const ANALYSIS_DEDUPE_MS = 60_000;
+// How long to let /api/analyze run before aborting client-side. Kept under the
+// route's maxDuration (60) so a hung request is dropped before it bills.
+const ANALYSIS_TIMEOUT_MS = 55_000;
+const recentAnalyses = new Map<
+  string,
+  { at: number; analysis: ProductAnalysis }
+>();
+function analysisKey(text: string, hasProfile: boolean): string {
+  const s = text.replace(/\s+/g, " ").trim();
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;
+  return `${s.length}:${h}:${hasProfile ? "hp" : "no"}`;
+}
+
+/**
+ * True when a Supabase write failed only because a column in the payload does
+ * not exist on this database yet (a pending migration). Lets saveScan retry
+ * with just the base columns instead of losing the scan entirely.
+ */
+function isMissingColumnError(e: unknown): boolean {
+  const err = e as { code?: string; message?: string } | null;
+  if (!err) return false;
+  if (err.code === "PGRST204") return true;
+  return /could not find the '.*' column|column ".*" of relation|column .* does not exist/i.test(
+    err.message ?? "",
+  );
+}
+
 const titleCase = (s: string) =>
   s.replace(/[_-]+/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 
@@ -151,13 +204,31 @@ const DECLARATION_LABELS: Record<string, string> = {
 const declLabel = (key: string) => DECLARATION_LABELS[key] ?? titleCase(key);
 
 const isNotApplicable = (item: ComplianceItem) =>
-  !item.present && item.compliant && /not applicable/i.test(item.issue ?? "");
+  item.status === "not_applicable" ||
+  (!item.present && item.compliant && /not applicable/i.test(item.issue ?? ""));
+
+/**
+ * The scan could not read enough of the label to score it honestly — either no
+ * ingredients were found, or too many declarations were "not visible". The
+ * route/normalizer null the score and set the *_status; treat either signal as
+ * insufficient. Such a scan gets the partial-scan screen, no PDF, no save.
+ */
+function isInsufficientData(a: ProductAnalysis): boolean {
+  const oa = a.overall_assessment;
+  return (
+    !oa ||
+    oa.safety_score == null ||
+    oa.compliance_score == null ||
+    oa.safety_status === "insufficient_data" ||
+    oa.compliance_status === "insufficient_data"
+  );
+}
 
 function deriveComplianceStatus(
   a: ProductAnalysis,
 ): "compliant" | "non_compliant" | "partial" {
   const items = Object.values(a.legal_metrology_compliance ?? {}).filter(
-    (v) => !isNotApplicable(v),
+    (v) => !isNotApplicable(v) && v.status !== "not_visible",
   );
   if (items.length === 0) return "partial";
   const pass = items.filter((v) => v.present && v.compliant).length;
@@ -302,10 +373,23 @@ export default function ScanPage() {
     message: string;
     recommendation: string;
   } | null>(null);
-  const [verifyText, setVerifyText] = useState("");
-  const [verifyExpanded, setVerifyExpanded] = useState(false);
+  const [notPackaged, setNotPackaged] = useState<{
+    detected: string | null;
+    message: string;
+  } | null>(null);
   const [unreadableFields, setUnreadableFields] = useState<string[]>([]);
+  // Persistent "view extracted text" control — available during analysis AND
+  // after results. `extracted` is set the moment text is settled.
+  const [extracted, setExtracted] = useState<{ text: string; tier: Tier } | null>(
+    null,
+  );
+  const [showTextPanel, setShowTextPanel] = useState(false);
+  const [textDraft, setTextDraft] = useState("");
+  const [textReanalyzing, setTextReanalyzing] = useState(false);
   const [manual, setManual] = useState<ManualForm>(EMPTY_MANUAL);
+  // Set from ?verify=<product name> when arriving via a "Re-verify this product"
+  // link on the safe-products page — just a hint shown on the capture screen.
+  const [reVerifyName, setReVerifyName] = useState<string | null>(null);
   const [result, setResult] = useState<{
     analysis: ProductAnalysis;
     extractedText: string;
@@ -315,16 +399,26 @@ export default function ScanPage() {
   const [expanded, setExpanded] = useState<Set<number>>(new Set());
   const [save, setSave] = useState<SaveState>({ state: "idle" });
   const [showComplaint, setShowComplaint] = useState(false);
-  const [showRawText, setShowRawText] = useState(false);
   const [pdfBusy, setPdfBusy] = useState(false);
+  // Category-detection review (shown when confidence is 'low', or on demand).
+  const [categoryConfirmed, setCategoryConfirmed] = useState(false);
+  const [categoryEditing, setCategoryEditing] = useState(false);
+  const [categoryPick, setCategoryPick] = useState<DetectedCategoryId | "">("");
+  const [reanalyzing, setReanalyzing] = useState(false);
 
   const toast = useToast();
   const cameraInputRef = useRef<HTMLInputElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
   const previewUrlRef = useRef<string | null>(null);
-  // Resolver + timeout handle for the "verify" gate (see runAnalysis).
-  const verifyResolveRef = useRef<((choice: VerifyChoice) => void) | null>(null);
-  const verifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    try {
+      const name = new URLSearchParams(window.location.search).get("verify");
+      if (name) setReVerifyName(name.trim().slice(0, 120));
+    } catch {
+      /* no query string — nothing to prefill */
+    }
+  }, []);
 
   useEffect(() => {
     previewUrlRef.current = previewUrl;
@@ -335,28 +429,36 @@ export default function ScanPage() {
     },
     [],
   );
-  useEffect(
-    () => () => {
-      if (verifyTimerRef.current) clearTimeout(verifyTimerRef.current);
-    },
-    [],
-  );
 
-  const selectFile = useCallback((picked: File) => {
-    setPreviewUrl((prev) => {
-      if (prev) URL.revokeObjectURL(prev);
-      return URL.createObjectURL(picked);
-    });
-    setFile(picked);
-    setResult(null);
-    setErrInfo(null);
-    setGarbled(null);
-    setUnreadableFields([]);
-    setManual(EMPTY_MANUAL);
-    setSteps(IDLE_STEPS);
-    setSave({ state: "idle" });
-    setView("capture");
+  const resetCategoryReview = useCallback(() => {
+    setCategoryConfirmed(false);
+    setCategoryEditing(false);
+    setCategoryPick("");
+    setReanalyzing(false);
   }, []);
+
+  const selectFile = useCallback(
+    (picked: File) => {
+      setPreviewUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return URL.createObjectURL(picked);
+      });
+      setFile(picked);
+      setResult(null);
+      setErrInfo(null);
+      setGarbled(null);
+      setNotPackaged(null);
+      setUnreadableFields([]);
+      setExtracted(null);
+      setShowTextPanel(false);
+      setManual(EMPTY_MANUAL);
+      setSteps(IDLE_STEPS);
+      setSave({ state: "idle" });
+      resetCategoryReview();
+      setView("capture");
+    },
+    [resetCategoryReview],
+  );
 
   const onInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const picked = e.target.files?.[0];
@@ -373,23 +475,16 @@ export default function ScanPage() {
     setResult(null);
     setErrInfo(null);
     setGarbled(null);
+    setNotPackaged(null);
     setUnreadableFields([]);
+    setExtracted(null);
+    setShowTextPanel(false);
     setManual(EMPTY_MANUAL);
     setSteps(IDLE_STEPS);
     setSave({ state: "idle" });
+    resetCategoryReview();
     setView("capture");
   };
-
-  /** Resolve the pending "verify" gate with the user's pick (or the timeout). */
-  const settleVerify = useCallback((choice: VerifyChoice) => {
-    if (verifyTimerRef.current) {
-      clearTimeout(verifyTimerRef.current);
-      verifyTimerRef.current = null;
-    }
-    const resolve = verifyResolveRef.current;
-    verifyResolveRef.current = null;
-    resolve?.(choice);
-  }, []);
 
   // --- shared tail: extracted text -> /api/analyze -> report ------------
   // Called by every path once a `sourceText` and its `tier` are settled
@@ -400,6 +495,14 @@ export default function ScanPage() {
       tier: Tier,
       opts?: { lowConfidence?: boolean },
     ) => {
+      console.info("[ocr] final text -> analysis:", {
+        tier,
+        chars: sourceText.length,
+        words: sourceText.trim() ? sourceText.trim().split(/\s+/).length : 0,
+      });
+      // Make the raw text reachable from the persistent control immediately —
+      // before analysis even returns.
+      setExtracted({ text: sourceText, tier });
       setSteps((s) => ({ ...s, analyze: "active" }));
 
       // Personalise the analysis with the user's health profile, if they set one.
@@ -407,48 +510,89 @@ export default function ScanPage() {
       const userHealthProfile = isHealthProfileEmpty(hp) ? null : hp;
 
       let analysis: ProductAnalysis;
-      try {
-        const res = await fetch("/api/analyze", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ extractedText: sourceText, userHealthProfile }),
-        });
-        const data = await res.json();
-
-        // Claude judged the text unreadable and refused to analyse it.
-        if (res.status === 422 && data?.error === "garbled_text") {
-          setGarbled({
-            message:
-              typeof data.message === "string" && data.message.trim()
-                ? data.message
-                : "The extracted text appears corrupted.",
-            recommendation:
-              typeof data.recommendation === "string" &&
-              data.recommendation.trim()
-                ? data.recommendation
-                : "Please retake the photo.",
+      const dedupeKey = analysisKey(sourceText, !!userHealthProfile);
+      const cached = recentAnalyses.get(dedupeKey);
+      if (cached && Date.now() - cached.at < ANALYSIS_DEDUPE_MS) {
+        analysis = cached.analysis;
+      } else {
+        const controller = new AbortController();
+        const timeout = setTimeout(
+          () => controller.abort(),
+          ANALYSIS_TIMEOUT_MS,
+        );
+        try {
+          const res = await fetch("/api/analyze", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ extractedText: sourceText, userHealthProfile }),
+            signal: controller.signal,
           });
-          setSteps((s) => ({ ...s, analyze: "done" }));
-          setView("garbled");
-          return;
-        }
+          const data = await res.json();
 
-        if (!res.ok) {
-          setErrInfo({
-            message: data?.error ?? "The analysis service failed to respond.",
-            hint: "Check your connection and try again.",
-          });
+          // The router decided the photo isn't a labelled package at all —
+          // no Sonnet call, no score, nothing saved.
+          if (res.status === 422 && data?.error === "not_a_packaged_product") {
+            setNotPackaged({
+              detected:
+                typeof data.detected === "string" && data.detected.trim()
+                  ? data.detected.trim()
+                  : null,
+              message:
+                typeof data.message === "string" && data.message.trim()
+                  ? data.message
+                  : "We couldn't find any product label in this photo.",
+            });
+            setSteps((s) => ({ ...s, analyze: "done" }));
+            setView("notpackaged");
+            return;
+          }
+
+          // Claude judged the text unreadable and refused to analyse it.
+          if (res.status === 422 && data?.error === "garbled_text") {
+            setGarbled({
+              message:
+                typeof data.message === "string" && data.message.trim()
+                  ? data.message
+                  : "The extracted text appears corrupted.",
+              recommendation:
+                typeof data.recommendation === "string" &&
+                data.recommendation.trim()
+                  ? data.recommendation
+                  : "Please retake the photo.",
+            });
+            setSteps((s) => ({ ...s, analyze: "done" }));
+            setView("garbled");
+            return;
+          }
+
+          if (!res.ok) {
+            setErrInfo({
+              message: data?.error ?? "The analysis service failed to respond.",
+              hint: "Check your connection and try again.",
+            });
+            setView("error");
+            return;
+          }
+          analysis = data.analysis as ProductAnalysis;
+          recentAnalyses.set(dedupeKey, { at: Date.now(), analysis });
+        } catch (err) {
+          setErrInfo(
+            err instanceof DOMException && err.name === "AbortError"
+              ? {
+                  message:
+                    "The analysis took too long and was stopped before it could run up a charge.",
+                  hint: "Try again, or scan a smaller portion of the label.",
+                }
+              : {
+                  message: "Could not reach the analysis service.",
+                  hint: "Check your connection and try again.",
+                },
+          );
           setView("error");
           return;
+        } finally {
+          clearTimeout(timeout);
         }
-        analysis = data.analysis as ProductAnalysis;
-      } catch {
-        setErrInfo({
-          message: "Could not reach the analysis service.",
-          hint: "Check your connection and try again.",
-        });
-        setView("error");
-        return;
       }
       if (!analysis || typeof analysis !== "object") {
         setErrInfo({ message: "The analysis came back empty. Please try again." });
@@ -472,7 +616,11 @@ export default function ScanPage() {
       setExpanded(new Set());
       setView("results");
 
-      if (file) void saveScan(analysis, sourceText, file);
+      // A partial scan has no honest score — keep it out of history and the
+      // safe-products database entirely.
+      if (file && !isInsufficientData(analysis)) {
+        void saveScan(analysis, sourceText, file);
+      }
     },
     [file],
   );
@@ -496,10 +644,13 @@ export default function ScanPage() {
       setView("processing");
       setErrInfo(null);
       setGarbled(null);
+      setNotPackaged(null);
       setUnreadableFields([]);
       setShowComplaint(false);
-      setShowRawText(false);
+      setExtracted(null);
+      setShowTextPanel(false);
       setOcrProgress(0);
+      resetCategoryReview();
       setSteps({
         ...IDLE_STEPS,
         ocr: forceVision ? "done" : "active",
@@ -540,43 +691,28 @@ export default function ScanPage() {
 
         setSteps((s) => ({ ...s, ocr: "done" }));
 
-        // ---- Optional 3s user gut-check on the raw OCR text ----
-        let userChoice: VerifyChoice = "auto";
+        // ---- Auto quality gate on the on-device read (no user pause) ----
+        // Analysis starts immediately; the user can review/correct the text at
+        // any time via the persistent "View extracted text" control.
         if (tesseractText.trim()) {
-          setVerifyText(tesseractText);
-          setVerifyExpanded(false);
-          setView("verify");
-          userChoice = await new Promise<VerifyChoice>((resolve) => {
-            verifyResolveRef.current = resolve;
-            verifyTimerRef.current = setTimeout(() => {
-              verifyTimerRef.current = null;
-              verifyResolveRef.current = null;
-              resolve("auto");
-            }, 3000);
-          });
-          setView("processing");
-        }
-
-        if (userChoice === "analyze") {
-          // User vouched for the on-device read — straight to analysis.
-          setSteps((s) => ({ ...s, verify: "done" }));
-          await analyzeText(tesseractText, "tesseract", { lowConfidence });
-          return;
-        }
-        if (userChoice === "auto") {
           setSteps((s) => ({ ...s, verify: "active" }));
-          await sleep(250); // let the "Verifying…" row register
+          await sleep(200); // let the "Verifying…" row register
+          const t1Score = validateExtractedText(tesseractText).score;
+          // Tesseract stays strict (>= 3) — it is the least reliable reader.
           const tesseractGood =
-            ocrConfidence > 70 &&
-            ocrWordCount > 30 &&
-            validateExtractedText(tesseractText).score >= 3;
+            ocrConfidence > 70 && ocrWordCount > 30 && t1Score >= 3;
+          console.info("[ocr] tier1 gate:", {
+            confidence: ocrConfidence,
+            wordCount: ocrWordCount,
+            validationScore: t1Score,
+            passed: tesseractGood,
+          });
           setSteps((s) => ({ ...s, verify: "done" }));
           if (tesseractGood) {
             await analyzeText(tesseractText, "tesseract", { lowConfidence });
             return;
           }
         } else {
-          // userChoice === "vision" — user says the read is wrong.
           setSteps((s) => ({ ...s, verify: "done" }));
         }
         // Tier 1 did not produce usable text — fall through to the Vision tiers.
@@ -594,13 +730,22 @@ export default function ScanPage() {
       try {
         const p = await imageToVisionPayload(file);
         payload = { base64: p.base64, mediaType: p.mediaType };
-      } catch {
+      } catch (err) {
+        console.warn("[ocr] vision payload encode failed:", err);
         payload = null;
       }
 
+      const attempted = { tesseract: !forceVision, haiku: false, sonnet: false };
+      const tesseractScore = validateExtractedText(tesseractText).score;
+
       // ---- TIER 2: Haiku Vision ----
+      // Any failure here (throw, timeout, non-200) is swallowed and we escalate
+      // straight to Sonnet — never a user-facing error at this tier.
       let haikuText = "";
       if (payload) {
+        attempted.haiku = true;
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 30_000);
         try {
           const res = await fetch("/api/extract-text", {
             method: "POST",
@@ -609,17 +754,33 @@ export default function ScanPage() {
               imageBase64: payload.base64,
               mediaType: payload.mediaType,
             }),
+            signal: ctrl.signal,
           });
-          const data = await res.json();
+          const data = await res.json().catch(() => ({}));
+          console.info("[ocr] tier2 haiku:", {
+            status: res.status,
+            ok: res.ok,
+            chars:
+              typeof data?.extractedText === "string"
+                ? data.extractedText.length
+                : 0,
+          });
           if (res.ok && typeof data.extractedText === "string") {
             haikuText = data.extractedText.trim();
           }
-        } catch {
-          // fall through to tier 3
+        } catch (err) {
+          console.warn("[ocr] tier2 haiku threw / timed out:", err);
+        } finally {
+          clearTimeout(t);
         }
+      } else {
+        console.warn("[ocr] tier2 haiku skipped — no image payload");
       }
 
-      if (haikuText && validateExtractedText(haikuText).score >= 3) {
+      // Vision output is trusted at a LOWER bar than Tesseract (>= 2, not 3).
+      const haikuScore = haikuText ? validateExtractedText(haikuText).score : 0;
+      if (haikuText && haikuScore >= 2) {
+        console.info("[ocr] accepted tier2 haiku (score", haikuScore, ")");
         setSteps((s) => ({ ...s, enhance: "done" }));
         await analyzeText(haikuText, "haiku");
         return;
@@ -631,6 +792,9 @@ export default function ScanPage() {
       let sonnetText = "";
       let sonnetUnreadable: string[] = [];
       if (payload) {
+        attempted.sonnet = true;
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 55_000);
         try {
           const res = await fetch("/api/extract-text-advanced", {
             method: "POST",
@@ -639,8 +803,17 @@ export default function ScanPage() {
               imageBase64: payload.base64,
               mediaType: payload.mediaType,
             }),
+            signal: ctrl.signal,
           });
-          const data = await res.json();
+          const data = await res.json().catch(() => ({}));
+          console.info("[ocr] tier3 sonnet:", {
+            status: res.status,
+            ok: res.ok,
+            chars:
+              typeof data?.extractedText === "string"
+                ? data.extractedText.length
+                : 0,
+          });
           if (res.ok && typeof data.extractedText === "string") {
             sonnetText = data.extractedText.trim();
           }
@@ -650,35 +823,65 @@ export default function ScanPage() {
               .map((x: string) => x.trim())
               .filter(Boolean);
           }
-        } catch {
-          // handled below
+        } catch (err) {
+          console.warn("[ocr] tier3 sonnet threw / timed out:", err);
+        } finally {
+          clearTimeout(t);
         }
+      } else {
+        console.warn("[ocr] tier3 sonnet skipped — no image payload");
       }
 
       setSteps((s) => ({ ...s, advanced: "done" }));
 
-      if (sonnetText && validateExtractedText(sonnetText).score >= 3) {
+      // Sonnet is the last reader: accept at the lower vision bar, and accept
+      // ANY substantial text it returned rather than dead-ending.
+      const sonnetScore = sonnetText
+        ? validateExtractedText(sonnetText).score
+        : 0;
+      if (sonnetText && (sonnetScore >= 2 || sonnetText.length >= 24)) {
+        console.info(
+          "[ocr] accepted tier3 sonnet (score",
+          sonnetScore,
+          "chars",
+          sonnetText.length,
+          ")",
+        );
         await analyzeText(sonnetText, "sonnet");
         return;
       }
 
-      // Safety net: if the Vision tiers never actually ran (the image could not
-      // be encoded, or both calls errored at the transport level) but Tesseract
-      // did read something plausible, analyse that rather than dead-ending.
-      if (
-        !payload &&
-        tesseractText.trim() &&
-        validateExtractedText(tesseractText).score >= 2
-      ) {
-        await analyzeText(tesseractText, "tesseract", { lowConfidence });
+      // Salvage: fall back to the best text an earlier tier produced before
+      // giving up. Vision text clears the >= 2 bar; Tesseract still needs >= 2.
+      const salvage: { text: string; tier: Tier } | null =
+        haikuText && haikuScore >= 2
+          ? { text: haikuText, tier: "haiku" }
+          : tesseractText.trim() && tesseractScore >= 2
+            ? { text: tesseractText, tier: "tesseract" }
+            : haikuText.length >= 40
+              ? { text: haikuText, tier: "haiku" }
+              : null;
+      if (salvage) {
+        console.info("[ocr] salvaged text from", salvage.tier);
+        await analyzeText(
+          salvage.text,
+          salvage.tier,
+          salvage.tier === "tesseract" ? { lowConfidence } : undefined,
+        );
         return;
       }
 
-      // All three tiers came up short — the image is genuinely unreadable.
+      // Every tier genuinely failed — only NOW show the "couldn't read" screen.
+      console.warn("[ocr] all tiers failed:", {
+        attempted,
+        tesseract: { chars: tesseractText.length, score: tesseractScore },
+        haiku: { chars: haikuText.length, score: haikuScore },
+        sonnet: { chars: sonnetText.length, score: sonnetScore },
+      });
       setUnreadableFields(sonnetUnreadable);
       setView("unreadable");
     },
-    [file, analyzeText],
+    [file, analyzeText, resetCategoryReview],
   );
 
   // --- manual entry -> analyze ----------------------------------------
@@ -690,6 +893,7 @@ export default function ScanPage() {
     }
     setErrInfo(null);
     setGarbled(null);
+    setNotPackaged(null);
     setView("processing");
     setSteps({
       ...IDLE_STEPS,
@@ -726,33 +930,189 @@ export default function ScanPage() {
       // Best-effort — a failed upload still saves the analysis, just without a photo.
       const imageUrl = await uploadProductImage(imageFile, user.id);
 
-      const { data, error } = await supabase
+      const fullRow: Record<string, unknown> = {
+        user_id: user.id,
+        product_name: pi.name ?? "Unknown product",
+        brand: pi.brand,
+        category: pi.category ?? "uncategorized",
+        detected_category: analysis.detected_category ?? null,
+        image_url: imageUrl,
+        extracted_text: extractedText,
+        compliance_status: deriveComplianceStatus(analysis),
+        compliance_details: analysis.legal_metrology_compliance ?? {},
+        ingredient_analysis: analysis.ingredient_analysis ?? [],
+        dosage_analysis: analysis.dosage_analysis ?? {},
+        personal_alerts: analysis.personal_alerts ?? [],
+        healthier_alternatives: buildAlternatives(analysis),
+        overall_score: score,
+      };
+
+      let { data, error } = await supabase
         .from("scanned_products")
-        .insert({
-          user_id: user.id,
-          product_name: pi.name ?? "Unknown product",
-          brand: pi.brand,
-          category: pi.category ?? "uncategorized",
-          image_url: imageUrl,
-          extracted_text: extractedText,
-          compliance_status: deriveComplianceStatus(analysis),
-          compliance_details: analysis.legal_metrology_compliance ?? {},
-          ingredient_analysis: analysis.ingredient_analysis ?? [],
-          dosage_analysis: analysis.dosage_analysis ?? {},
-          personal_alerts: analysis.personal_alerts ?? [],
-          healthier_alternatives: buildAlternatives(analysis),
-          overall_score: score,
-        })
+        .insert(fullRow)
         .select("id")
         .single();
 
-      if (error) {
+      // Resilience: on a database that predates the newer migrations, PostgREST
+      // rejects the WHOLE insert because one column is unknown (PGRST204). Retry
+      // without the optional columns so the scan still lands in history.
+      if (error && isMissingColumnError(error)) {
+        console.error(
+          "[saveScan] insert rejected for an unknown column — retrying with base columns only:",
+          error,
+        );
+        const baseRow = { ...fullRow };
+        delete baseRow.detected_category;
+        delete baseRow.dosage_analysis;
+        delete baseRow.personal_alerts;
+        ({ data, error } = await supabase
+          .from("scanned_products")
+          .insert(baseRow)
+          .select("id")
+          .single());
+      }
+
+      if (error || !data) {
+        console.error("[saveScan] insert failed:", error);
         setSave({ state: "error" });
         return;
       }
       setSave({ state: "saved", id: data.id as string });
-    } catch {
+    } catch (err) {
+      console.error("[saveScan] threw:", err);
       setSave({ state: "error" });
+    }
+  }
+
+  // --- re-run the analysis under a user-corrected category ------------
+  async function reanalyzeWithCategory(override: DetectedCategoryId) {
+    if (!result || reanalyzing) return;
+    setReanalyzing(true);
+    try {
+      const hp = await fetchHealthProfile();
+      const userHealthProfile = isHealthProfileEmpty(hp) ? null : hp;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), ANALYSIS_TIMEOUT_MS);
+      let data: { analysis?: ProductAnalysis };
+      try {
+        const res = await fetch("/api/analyze", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            extractedText: result.extractedText,
+            userHealthProfile,
+            categoryOverride: override,
+          }),
+          signal: controller.signal,
+        });
+        data = await res.json();
+        if (!res.ok || !data?.analysis) {
+          toast.error("Could not re-analyze with that category. Try again.");
+          return;
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+      const analysis = data.analysis as ProductAnalysis;
+      setResult((r) => (r ? { ...r, analysis } : r));
+      setExpanded(new Set());
+      setCategoryEditing(false);
+      setCategoryConfirmed(true);
+      setCategoryPick("");
+
+      // Keep the saved row in sync so history / search / PDF reflect the change.
+      if (save.state === "saved" && save.id) {
+        const pi = analysis.product_info ?? ({} as ProductAnalysis["product_info"]);
+        await supabase
+          .from("scanned_products")
+          .update({
+            category: pi.category ?? "uncategorized",
+            detected_category: analysis.detected_category ?? null,
+            compliance_status: deriveComplianceStatus(analysis),
+            compliance_details: analysis.legal_metrology_compliance ?? {},
+            ingredient_analysis: analysis.ingredient_analysis ?? [],
+            dosage_analysis: analysis.dosage_analysis ?? {},
+            personal_alerts: analysis.personal_alerts ?? [],
+            healthier_alternatives: buildAlternatives(analysis),
+            overall_score: clampScore(analysis.overall_assessment?.safety_score),
+          })
+          .eq("id", save.id);
+      }
+      toast.success("Re-analyzed for the selected category.");
+    } catch {
+      toast.error("Could not re-analyze with that category. Try again.");
+    } finally {
+      setReanalyzing(false);
+    }
+  }
+
+  // --- re-analyse using the user's edited extracted text -------------
+  async function reanalyzeWithText() {
+    const text = textDraft.trim();
+    if (!text || textReanalyzing || view !== "results") return;
+    setTextReanalyzing(true);
+    try {
+      const hp = await fetchHealthProfile();
+      const userHealthProfile = isHealthProfileEmpty(hp) ? null : hp;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), ANALYSIS_TIMEOUT_MS);
+      let data: { analysis?: ProductAnalysis };
+      try {
+        const res = await fetch("/api/analyze", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ extractedText: text, userHealthProfile }),
+          signal: controller.signal,
+        });
+        data = await res.json();
+        if (!res.ok || !data?.analysis) {
+          toast.error("Could not re-analyse. Try again.");
+          return;
+        }
+      } finally {
+        clearTimeout(timeout);
+      }
+      const analysis = data.analysis as ProductAnalysis;
+      setExtracted({ text, tier: "manual" });
+      setResult((r) =>
+        r
+          ? { ...r, analysis, extractedText: text, tier: "manual" }
+          : { analysis, extractedText: text, tier: "manual" },
+      );
+      setExpanded(new Set());
+      setShowTextPanel(false);
+
+      // Keep the saved row / safe-products state consistent.
+      if (isInsufficientData(analysis)) {
+        // a partial scan is never stored — nothing to sync
+      } else if (save.state === "saved" && save.id) {
+        const pi =
+          analysis.product_info ?? ({} as ProductAnalysis["product_info"]);
+        await supabase
+          .from("scanned_products")
+          .update({
+            product_name: pi.name ?? "Unknown product",
+            brand: pi.brand,
+            category: pi.category ?? "uncategorized",
+            detected_category: analysis.detected_category ?? null,
+            extracted_text: text,
+            compliance_status: deriveComplianceStatus(analysis),
+            compliance_details: analysis.legal_metrology_compliance ?? {},
+            ingredient_analysis: analysis.ingredient_analysis ?? [],
+            dosage_analysis: analysis.dosage_analysis ?? {},
+            personal_alerts: analysis.personal_alerts ?? [],
+            healthier_alternatives: buildAlternatives(analysis),
+            overall_score: clampScore(analysis.overall_assessment?.safety_score),
+          })
+          .eq("id", save.id);
+      } else if (file) {
+        void saveScan(analysis, text, file);
+      }
+      toast.success("Re-analysed with your corrections.");
+    } catch {
+      toast.error("Could not re-analyse. Try again.");
+    } finally {
+      setTextReanalyzing(false);
     }
   }
 
@@ -771,13 +1131,32 @@ export default function ScanPage() {
     for (const ing of ingredients) {
       counts[ing.safety_status] = (counts[ing.safety_status] ?? 0) + 1;
     }
+    const insufficient = isInsufficientData(a);
     const compliance = deriveComplianceStatus(a);
     const complianceIssues = Object.entries(a.legal_metrology_compliance ?? {})
-      .filter(([, v]) => v.issue && !isNotApplicable(v))
+      .filter(
+        ([, v]) => v.issue && !isNotApplicable(v) && v.status !== "not_visible",
+      )
       .map(([k, v]) => `${declLabel(k)}: ${v.issue}`);
     const hasViolations =
-      compliance !== "compliant" || counts.harmful > 0 || counts.banned > 0;
+      !insufficient &&
+      (compliance !== "compliant" || counts.harmful > 0 || counts.banned > 0);
     const alternatives = buildAlternatives(a);
+
+    // What we actually managed to read off the label (for the partial-scan UI).
+    const pi = a.product_info ?? ({} as ProductAnalysis["product_info"]);
+    const readFacts: { label: string; value: string }[] = [
+      ["Product name", pi.name],
+      ["Brand", pi.brand],
+      ["Net quantity", pi.net_weight],
+      ["MRP", pi.mrp],
+      ["Manufacture date", pi.manufacture_date],
+      ["Expiry / best before", pi.expiry_date],
+      ["FSSAI licence", pi.fssai_license],
+      ["Manufacturer", pi.manufacturer_address],
+    ]
+      .filter((e): e is [string, string] => Boolean(e[1] && String(e[1]).trim()))
+      .map(([label, value]) => ({ label, value: String(value) }));
 
     // Every personal-health-profile conflict: product-level alerts first, then
     // each ingredient's own flags (tagged with the ingredient name). Sorted
@@ -792,6 +1171,33 @@ export default function ScanPage() {
       ),
     ].sort((x, y) => SEVERITY_RANK[x.severity] - SEVERITY_RANK[y.severity]);
 
+    // "What you should know" — the model's headline findings, or a derived
+    // fallback so the section is never empty.
+    const modelFindings = (a.key_findings ?? [])
+      .map((s) => String(s).replace(/\s+/g, " ").trim())
+      .filter(Boolean)
+      .slice(0, 4);
+    const fallbackFindings: string[] = [];
+    if (counts.banned > 0)
+      fallbackFindings.push(
+        `Contains ${counts.banned} banned ingredient${counts.banned > 1 ? "s" : ""}`,
+      );
+    if (counts.harmful > 0)
+      fallbackFindings.push(
+        `Contains ${counts.harmful} harmful additive${counts.harmful > 1 ? "s" : ""}`,
+      );
+    if (compliance === "non_compliant")
+      fallbackFindings.push("Fails several label-declaration checks");
+    else if (compliance === "partial")
+      fallbackFindings.push("Some label declarations are missing");
+    if (a.dosage_analysis?.cumulative_risk === "high")
+      fallbackFindings.push("High overall additive load");
+    if (fallbackFindings.length === 0)
+      fallbackFindings.push("No harmful or banned ingredients found");
+    const keyFindings = (
+      modelFindings.length ? modelFindings : fallbackFindings
+    ).slice(0, 4);
+
     return {
       a,
       ingredients,
@@ -801,6 +1207,9 @@ export default function ScanPage() {
       hasViolations,
       alternatives,
       personalFlags,
+      insufficient,
+      readFacts,
+      keyFindings,
     };
   }, [result]);
 
@@ -853,6 +1262,12 @@ export default function ScanPage() {
       return next;
     });
 
+  const openTextPanel = () => {
+    setTextDraft(extracted?.text ?? "");
+    setShowTextPanel(true);
+  };
+  const closeTextPanel = () => setShowTextPanel(false);
+
   // -------------------------------------------------------------------
   // Render
   // -------------------------------------------------------------------
@@ -880,6 +1295,15 @@ export default function ScanPage() {
       {/* ============ CAPTURE / PREVIEW ============ */}
       {view === "capture" && (
         <section className="flex flex-col gap-4">
+          {reVerifyName && (
+            <p className="flex items-start gap-2 rounded-xl border border-teal-500/30 bg-teal-500/[0.06] px-3 py-2 text-sm text-teal-800 dark:text-teal-200">
+              <RefreshCw className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+              <span>
+                Scan <span className="font-semibold">{reVerifyName}</span> to
+                update its safety verification.
+              </span>
+            </p>
+          )}
           <p className="text-sm text-zinc-600 dark:text-zinc-400">
             Photograph the packaging — the ingredients list and the MRP /
             net-quantity panel are the most useful. Text is read on your device,
@@ -970,6 +1394,19 @@ export default function ScanPage() {
       {/* ============ PROCESSING ============ */}
       {view === "processing" && (
         <section className="flex flex-col gap-4">
+          {extracted && (
+            <ExtractedTextControl
+              extracted={extracted}
+              open={showTextPanel}
+              canReanalyse={false}
+              draft={textDraft}
+              busy={textReanalyzing}
+              onOpen={openTextPanel}
+              onClose={closeTextPanel}
+              onDraft={setTextDraft}
+              onReanalyse={reanalyzeWithText}
+            />
+          )}
           {previewUrl && (
             // eslint-disable-next-line @next/next/no-img-element
             <img
@@ -1004,72 +1441,6 @@ export default function ScanPage() {
             />
             <StepRow status={steps.report} label="📊 Generating your report…" />
           </ol>
-        </section>
-      )}
-
-      {/* ============ USER TEXT VERIFICATION ============ */}
-      {view === "verify" && (
-        <section className="flex flex-col gap-4">
-          {previewUrl && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img
-              src={previewUrl}
-              alt="Product being analysed"
-              loading="lazy"
-              className="mx-auto max-h-44 rounded-2xl border border-zinc-200 object-contain dark:border-white/10"
-            />
-          )}
-
-          <div className="rounded-2xl border border-zinc-200 p-5 dark:border-white/10">
-            <p className="text-sm font-semibold">Quick check before we analyse</p>
-            <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-              We read the text on your device. Take a quick look if you like — or
-              just wait and we&rsquo;ll check it for you.
-            </p>
-
-            <button
-              type="button"
-              onClick={() => setVerifyExpanded((v) => !v)}
-              aria-expanded={verifyExpanded}
-              className="mt-3 flex w-full items-center gap-2 rounded-xl border border-zinc-200 px-3 py-2.5 text-left text-sm font-medium dark:border-white/10"
-            >
-              <span className="flex-1">📝 Preview extracted text</span>
-              <ChevronDown
-                className={`h-4 w-4 shrink-0 text-zinc-400 transition-transform ${
-                  verifyExpanded ? "rotate-180" : ""
-                }`}
-                aria-hidden
-              />
-            </button>
-
-            {verifyExpanded && (
-              <pre className="mt-2 max-h-[150px] overflow-auto whitespace-pre-wrap rounded-xl bg-zinc-100 p-3 font-mono text-[11px] leading-relaxed text-zinc-700 dark:bg-white/[0.06] dark:text-zinc-300">
-                {verifyText || "No text was read from this image."}
-              </pre>
-            )}
-
-            <div className="mt-4 grid grid-cols-1 gap-2 sm:grid-cols-2">
-              <button
-                type="button"
-                onClick={() => settleVerify("analyze")}
-                className="inline-flex items-center justify-center gap-2 rounded-xl bg-green-600 px-4 py-2.5 text-sm font-semibold text-white transition-transform active:scale-[0.99]"
-              >
-                ✅ Looks correct — Analyze
-              </button>
-              <button
-                type="button"
-                onClick={() => settleVerify("vision")}
-                className="inline-flex items-center justify-center gap-2 rounded-xl border border-zinc-300 px-4 py-2.5 text-sm font-semibold transition-colors hover:bg-zinc-50 dark:border-white/15 dark:hover:bg-white/[0.03]"
-              >
-                ❌ Text looks wrong — Use AI reading
-              </button>
-            </div>
-
-            <p className="mt-3 text-center text-xs text-zinc-500">
-              Can&rsquo;t verify? Don&rsquo;t worry — we&rsquo;ll auto-check the
-              text quality.
-            </p>
-          </div>
         </section>
       )}
 
@@ -1155,6 +1526,60 @@ export default function ScanPage() {
               <RotateCcw className="h-4 w-4" aria-hidden />
               Retake photo
             </button>
+          </div>
+        </section>
+      )}
+
+      {/* ============ NOT A PACKAGED PRODUCT ============ */}
+      {view === "notpackaged" && notPackaged && (
+        <section className="flex flex-col gap-4">
+          {previewUrl && (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+              src={previewUrl}
+              alt="Photo taken"
+              loading="lazy"
+              className="mx-auto max-h-44 rounded-2xl border border-zinc-200 object-contain dark:border-white/10"
+            />
+          )}
+          <div className="flex flex-col gap-3 rounded-2xl border border-zinc-200 p-5 dark:border-white/10">
+            <div className="flex items-start gap-2">
+              <Package
+                className="mt-0.5 h-5 w-5 shrink-0 text-zinc-400"
+                aria-hidden
+              />
+              <div>
+                <p className="font-semibold">
+                  This doesn&rsquo;t look like a packaged product
+                </p>
+                <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                  {notPackaged.message}
+                </p>
+                {notPackaged.detected && (
+                  <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
+                    It looks like this might be {notPackaged.detected}.
+                  </p>
+                )}
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={reset}
+                className="inline-flex items-center gap-2 rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white"
+              >
+                <Camera className="h-4 w-4" aria-hidden />
+                Take another photo
+              </button>
+              <button
+                type="button"
+                onClick={() => setView("manual")}
+                className="inline-flex items-center gap-2 rounded-xl border border-zinc-300 px-4 py-2 text-sm font-semibold dark:border-white/15"
+              >
+                <PencilLine className="h-4 w-4" aria-hidden />
+                Enter details manually
+              </button>
+            </div>
           </div>
         </section>
       )}
@@ -1306,6 +1731,19 @@ export default function ScanPage() {
       {/* ============ RESULTS ============ */}
       {view === "results" && derived && (
         <>
+          {extracted && (
+            <ExtractedTextControl
+              extracted={extracted}
+              open={showTextPanel}
+              canReanalyse
+              draft={textDraft}
+              busy={textReanalyzing}
+              onOpen={openTextPanel}
+              onClose={closeTextPanel}
+              onDraft={setTextDraft}
+              onReanalyse={reanalyzeWithText}
+            />
+          )}
           {result?.tier && (
             <p className="flex items-center gap-2 rounded-xl bg-teal-600/10 px-3 py-2 text-xs font-medium text-teal-800 dark:text-teal-200">
               <Sparkles className="h-4 w-4 shrink-0" aria-hidden />
@@ -1324,49 +1762,122 @@ export default function ScanPage() {
             </p>
           )}
 
-          {/* a) Product header + gauge */}
-          <section className="flex flex-col items-center gap-3 rounded-2xl border border-zinc-200 p-5 text-center dark:border-white/10">
-            <div>
-              <h2 className="text-lg font-bold tracking-tight">
-                {derived.a.product_info?.name ?? "Unidentified product"}
-              </h2>
-              {derived.a.product_info?.brand && (
-                <p className="text-sm text-zinc-500">{derived.a.product_info.brand}</p>
-              )}
-              {derived.a.product_info?.category && (
-                <span className="mt-2 inline-block rounded-full bg-teal-600/10 px-2.5 py-1 text-xs font-medium text-teal-700 dark:text-teal-300">
-                  {titleCase(derived.a.product_info.category)}
-                </span>
-              )}
-            </div>
-            <SafetyGauge score={derived.a.overall_assessment?.safety_score ?? 0} />
-            {derived.a.overall_assessment?.summary && (
-              <p className="text-sm text-zinc-600 dark:text-zinc-400">
-                {derived.a.overall_assessment.summary}
-              </p>
-            )}
-            {derived.a.overall_assessment?.recommendation && (
-              <p className="text-sm font-medium">
-                {derived.a.overall_assessment.recommendation}
-              </p>
-            )}
-            <SaveNote save={save} />
-          </section>
+          {/* a-1) Detected product category + which rules were applied */}
+          <CategoryBanner
+            analysis={derived.a}
+            confirmed={categoryConfirmed}
+            editing={categoryEditing}
+            pick={categoryPick}
+            reanalyzing={reanalyzing}
+            onConfirm={() => setCategoryConfirmed(true)}
+            onStartEdit={() => setCategoryEditing(true)}
+            onCancelEdit={() => {
+              setCategoryEditing(false);
+              setCategoryPick("");
+            }}
+            onPick={setCategoryPick}
+            onReanalyze={reanalyzeWithCategory}
+          />
 
+          {/* a0) Did this scan make it into the verified safe-products list? */}
+          {!derived.insufficient &&
+            save.state === "saved" &&
+            (clampScore(derived.a.overall_assessment?.safety_score) >= 75 ? (
+              <p className="flex items-start gap-2 rounded-xl border border-green-500/40 bg-green-500/10 px-3 py-2 text-sm text-green-800 dark:text-green-200">
+                <Sparkles className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+                <span>
+                  🌟 This product has been added to our safe products database!
+                  Other users can now discover it.
+                </span>
+              </p>
+            ) : (
+              <p className="flex items-start gap-2 rounded-xl bg-zinc-500/10 px-3 py-2 text-sm text-zinc-600 dark:text-zinc-400">
+                <Circle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+                <span>
+                  This product didn&rsquo;t meet our safety threshold (75+). It
+                  won&rsquo;t appear in safe product recommendations.
+                </span>
+              </p>
+            ))}
+
+          {/* a) Product header + gauge — OR the partial-scan notice */}
+          {derived.insufficient ? (
+            <section className="flex flex-col gap-3 rounded-2xl border-2 border-amber-400/70 bg-amber-50 p-5 dark:border-amber-500/40 dark:bg-amber-500/[0.08]">
+              <p className="flex items-start gap-2 text-sm font-bold text-amber-900 dark:text-amber-200">
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" aria-hidden />
+                ⚠️ Partial scan — we could only read part of this label
+              </p>
+              <p className="text-sm text-amber-800 dark:text-amber-200/90">
+                To get a full safety report, photograph the back of the pack
+                showing the complete ingredients list, FSSAI number, MRP and
+                dates.
+              </p>
+              <button
+                type="button"
+                onClick={reset}
+                className="inline-flex items-center gap-2 self-start rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white"
+              >
+                <Camera className="h-4 w-4" aria-hidden />
+                Scan the full label
+              </button>
+              {derived.readFacts.length > 0 && (
+                <div className="rounded-xl border border-amber-400/40 bg-white/60 p-3 dark:bg-white/[0.03]">
+                  <p className="text-xs font-semibold uppercase tracking-wide text-amber-800 dark:text-amber-300">
+                    What we could read
+                  </p>
+                  <dl className="mt-1.5 flex flex-col gap-1 text-sm">
+                    {derived.readFacts.map((f) => (
+                      <div key={f.label} className="flex gap-2">
+                        <dt className="shrink-0 text-zinc-500">{f.label}:</dt>
+                        <dd className="font-medium">{f.value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </div>
+              )}
+              <SaveNote save={save} />
+            </section>
+          ) : (
+          <>
+          {/* 1) VERDICT CARD */}
+          <VerdictCard a={derived.a} save={save} />
+
+          {/* 2) What you should know */}
+          {derived.keyFindings.length > 0 && (
+            <section className="flex flex-col gap-2 rounded-2xl border border-zinc-200 p-5 dark:border-white/10">
+              <h3 className="text-sm font-semibold">What you should know</h3>
+              <ul className="flex flex-col gap-1.5">
+                {derived.keyFindings.map((f, i) => (
+                  <li key={i} className="flex items-start gap-2 text-sm">
+                    <span
+                      className="mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full bg-teal-500"
+                      aria-hidden
+                    />
+                    <span>{f}</span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {/* 3) Detailed sections — collapsed by default */}
           {/* b) Legal Metrology Compliance */}
-          <section className="flex flex-col gap-3 rounded-2xl border border-zinc-200 p-5 dark:border-white/10">
-            <div className="flex items-center justify-between gap-2">
-              <h3 className="flex items-center gap-2 text-sm font-semibold">
-                <ClipboardCheck className="h-4 w-4 text-teal-700 dark:text-teal-400" aria-hidden />
-                Legal Metrology Compliance
-              </h3>
+          <Collapsible
+            title={resolveCategory(derived.a.detected_category).complianceHeading}
+            icon={
+              <ClipboardCheck
+                className="h-4 w-4 text-teal-700 dark:text-teal-400"
+                aria-hidden
+              />
+            }
+            badge={
               <span
-                className={`rounded-full px-2.5 py-1 text-xs font-semibold ${COMPLIANCE_BADGE[derived.compliance].cls}`}
+                className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${COMPLIANCE_BADGE[derived.compliance].cls}`}
               >
                 {COMPLIANCE_BADGE[derived.compliance].label}
               </span>
-            </div>
-
+            }
+          >
             {Object.keys(derived.a.legal_metrology_compliance ?? {}).length === 0 ? (
               <p className="text-sm text-zinc-500">No compliance data was returned.</p>
             ) : (
@@ -1391,9 +1902,9 @@ export default function ScanPage() {
                 </ul>
               </div>
             )}
-          </section>
+          </Collapsible>
 
-          {/* b2) Personalized alerts — only when the profile produced flags */}
+          {/* b2) Personalized alerts — kept prominent, never collapsed */}
           {derived.personalFlags.length > 0 && (
             <section className="flex flex-col gap-2 rounded-2xl border-2 border-amber-400/70 bg-amber-50 p-5 dark:border-amber-500/40 dark:bg-amber-500/[0.08]">
               <h3 className="flex items-center gap-2 text-sm font-bold text-amber-900 dark:text-amber-200">
@@ -1429,12 +1940,27 @@ export default function ScanPage() {
             </section>
           )}
 
-          {/* c) Ingredient Analysis */}
-          <section className="flex flex-col gap-3 rounded-2xl border border-zinc-200 p-5 dark:border-white/10">
-            <h3 className="flex items-center gap-2 text-sm font-semibold">
-              <FlaskConical className="h-4 w-4 text-teal-700 dark:text-teal-400" aria-hidden />
-              Ingredient Analysis
-            </h3>
+          {/* c) Ingredient analysis */}
+          <Collapsible
+            title="Ingredient analysis"
+            icon={
+              <FlaskConical
+                className="h-4 w-4 text-teal-700 dark:text-teal-400"
+                aria-hidden
+              />
+            }
+            badge={
+              derived.counts.harmful + derived.counts.banned > 0 ? (
+                <span className="rounded-full bg-red-100 px-2 py-0.5 text-[11px] font-semibold text-red-700 dark:bg-red-500/15 dark:text-red-300">
+                  {derived.counts.harmful + derived.counts.banned} flagged
+                </span>
+              ) : (
+                <span className="rounded-full bg-green-100 px-2 py-0.5 text-[11px] font-semibold text-green-700 dark:bg-green-500/15 dark:text-green-300">
+                  All clear
+                </span>
+              )
+            }
+          >
             <p className="flex flex-wrap gap-x-3 gap-y-1 text-xs font-medium">
               <span className="text-green-600 dark:text-green-400">
                 {derived.counts.safe} safe
@@ -1469,18 +1995,32 @@ export default function ScanPage() {
                 ))}
               </ul>
             )}
-          </section>
+          </Collapsible>
 
           {/* c2) Additive dosage check */}
-          <DosageSection da={derived.a.dosage_analysis} />
+          <Collapsible
+            title="Additive dosage check"
+            icon={
+              <Gauge
+                className="h-4 w-4 text-teal-700 dark:text-teal-400"
+                aria-hidden
+              />
+            }
+          >
+            <DosageSection da={derived.a.dosage_analysis} embedded />
+          </Collapsible>
 
-          {/* d) Healthier Alternatives */}
+          {/* d) Healthier alternatives */}
           {derived.alternatives.length > 0 && (
-            <section className="flex flex-col gap-3 rounded-2xl border border-zinc-200 p-5 dark:border-white/10">
-              <h3 className="flex items-center gap-2 text-sm font-semibold">
-                <Salad className="h-4 w-4 text-green-600 dark:text-green-400" aria-hidden />
-                Healthier Alternatives
-              </h3>
+            <Collapsible
+              title="Healthier alternatives"
+              icon={
+                <Salad
+                  className="h-4 w-4 text-green-600 dark:text-green-400"
+                  aria-hidden
+                />
+              }
+            >
               <ul className="flex flex-col gap-3">
                 {derived.alternatives.map((alt, i) => (
                   <li
@@ -1510,27 +2050,62 @@ export default function ScanPage() {
                   </li>
                 ))}
               </ul>
-            </section>
+            </Collapsible>
           )}
 
-          {/* raw text (handy for debugging a bad read) */}
-          <div>
-            <button
-              type="button"
-              onClick={() => setShowRawText((v) => !v)}
-              className="text-xs font-medium text-zinc-500 underline underline-offset-2"
-            >
-              {showRawText ? "Hide" : "View"} extracted text
-            </button>
-            {showRawText && result && (
-              <pre className="mt-2 max-h-56 overflow-auto whitespace-pre-wrap rounded-xl border border-zinc-200 p-3 font-mono text-[11px] leading-relaxed text-zinc-600 dark:border-white/10 dark:text-zinc-400">
-                {result.extractedText}
-              </pre>
-            )}
-          </div>
+          {/* 4) Full assessment — the long summary lives here, collapsed */}
+          <Collapsible
+            title="Full assessment"
+            icon={
+              <FileText
+                className="h-4 w-4 text-teal-700 dark:text-teal-400"
+                aria-hidden
+              />
+            }
+          >
+            {derived.a.overall_assessment?.summary ? (
+              <p className="text-sm text-zinc-600 dark:text-zinc-400">
+                {derived.a.overall_assessment.summary}
+              </p>
+            ) : null}
+            {derived.a.overall_assessment?.recommendation ? (
+              <p className="mt-2 text-sm font-medium">
+                {derived.a.overall_assessment.recommendation}
+              </p>
+            ) : null}
+            {!derived.a.overall_assessment?.summary &&
+              !derived.a.overall_assessment?.recommendation && (
+                <p className="text-sm text-zinc-500">
+                  No additional assessment notes were returned.
+                </p>
+              )}
+          </Collapsible>
+          </>
+          )}
 
           {/* e) Sticky actions */}
           <div className="sticky bottom-16 -mx-4 mt-2 border-t border-zinc-200 bg-background/95 px-4 py-3 backdrop-blur dark:border-white/10 md:bottom-0">
+            {derived.insufficient ? (
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={reset}
+                className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl bg-teal-600 px-3 py-2.5 text-sm font-semibold text-white"
+              >
+                <Camera className="h-4 w-4" aria-hidden />
+                Scan the full label
+              </button>
+              <button
+                type="button"
+                onClick={() => setView("manual")}
+                className="inline-flex flex-1 items-center justify-center gap-2 rounded-xl border border-zinc-300 px-3 py-2.5 text-sm font-semibold dark:border-white/15"
+              >
+                <PencilLine className="h-4 w-4" aria-hidden />
+                Enter details manually
+              </button>
+            </div>
+            ) : (
+            <>
             <div className="flex flex-wrap gap-2">
               <button
                 type="button"
@@ -1579,37 +2154,34 @@ export default function ScanPage() {
                 <p className="font-semibold">File this with the authorities</p>
                 <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
                   Take your PDF report and the product photo, then raise a
-                  grievance on either portal:
+                  grievance on the portal for this product type (
+                  {resolveCategory(derived.a.detected_category).label}):
                 </p>
                 <ul className="mt-2 flex flex-col gap-1.5">
-                  <li>
-                    <a
-                      href={REFERENCE_METADATA.complaint_portals.fssai_foscos}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="font-medium text-teal-700 underline underline-offset-2 dark:text-teal-300"
-                    >
-                      FSSAI FoSCoS grievance portal
-                    </a>
-                    <span className="text-xs text-zinc-500"> — food safety issues</span>
-                  </li>
-                  <li>
-                    <a
-                      href={REFERENCE_METADATA.complaint_portals.national_consumer_helpline}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="font-medium text-teal-700 underline underline-offset-2 dark:text-teal-300"
-                    >
-                      National Consumer Helpline
-                    </a>
-                    <span className="text-xs text-zinc-500">
-                      {" "}
-                      — call{" "}
-                      {REFERENCE_METADATA.complaint_portals.national_consumer_helpline_number}
-                    </span>
-                  </li>
+                  {resolveCategory(derived.a.detected_category).portals.map(
+                    (portal) => (
+                      <li key={portal.url}>
+                        <a
+                          href={portal.url}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="font-medium text-teal-700 underline underline-offset-2 dark:text-teal-300"
+                        >
+                          {portal.label}
+                        </a>
+                        {portal.phone && (
+                          <span className="text-xs text-zinc-500">
+                            {" "}
+                            — call {portal.phone}
+                          </span>
+                        )}
+                      </li>
+                    ),
+                  )}
                 </ul>
               </div>
+            )}
+            </>
             )}
           </div>
         </>
@@ -1888,7 +2460,14 @@ function Field({ title, children }: { title: string; children: React.ReactNode }
   );
 }
 
-function DosageSection({ da }: { da: DosageAnalysis }) {
+function DosageSection({
+  da,
+  embedded = false,
+}: {
+  da: DosageAnalysis;
+  /** When true, render bare (no card chrome / heading) for use inside a Collapsible. */
+  embedded?: boolean;
+}) {
   const c = da.additive_count;
   const risk = RISK_STYLE[da.cumulative_risk] ?? RISK_STYLE.low;
 
@@ -1920,11 +2499,22 @@ function DosageSection({ da }: { da: DosageAnalysis }) {
       : "No regulated additives were identified in the ingredients list.";
 
   return (
-    <section className="flex flex-col gap-3 rounded-2xl border border-zinc-200 p-5 dark:border-white/10">
-      <h3 className="flex items-center gap-2 text-sm font-semibold">
-        <Gauge className="h-4 w-4 text-teal-700 dark:text-teal-400" aria-hidden />
-        Additive dosage check
-      </h3>
+    <div
+      className={
+        embedded
+          ? "flex flex-col gap-3"
+          : "flex flex-col gap-3 rounded-2xl border border-zinc-200 p-5 dark:border-white/10"
+      }
+    >
+      {!embedded && (
+        <h3 className="flex items-center gap-2 text-sm font-semibold">
+          <Gauge
+            className="h-4 w-4 text-teal-700 dark:text-teal-400"
+            aria-hidden
+          />
+          Additive dosage check
+        </h3>
+      )}
 
       <p className="text-sm text-zinc-600 dark:text-zinc-400">{summary}</p>
 
@@ -2013,6 +2603,340 @@ function DosageSection({ da }: { da: DosageAnalysis }) {
             ))}
           </ul>
         </div>
+      )}
+    </div>
+  );
+}
+
+/** Collapsible card used for every secondary results section (collapsed by default). */
+function Collapsible({
+  title,
+  icon,
+  badge,
+  defaultOpen = false,
+  children,
+}: {
+  title: string;
+  icon?: React.ReactNode;
+  badge?: React.ReactNode;
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}) {
+  const [open, setOpen] = useState(defaultOpen);
+  return (
+    <section className="overflow-hidden rounded-2xl border border-zinc-200 dark:border-white/10">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-5 py-3.5 text-left"
+      >
+        {icon}
+        <span className="flex-1 text-sm font-semibold">{title}</span>
+        {badge}
+        <ChevronDown
+          className={`h-4 w-4 shrink-0 text-zinc-400 transition-transform ${
+            open ? "rotate-180" : ""
+          }`}
+          aria-hidden
+        />
+      </button>
+      {open && (
+        <div className="flex flex-col gap-3 border-t border-zinc-100 px-5 py-4 dark:border-white/5">
+          {children}
+        </div>
+      )}
+    </section>
+  );
+}
+
+const VERDICT_META: Record<
+  Verdict,
+  { label: string; card: string; text: string; Icon: typeof CheckCircle2 }
+> = {
+  safe: {
+    label: "Safe to consume",
+    card: "border-green-500/50 bg-green-500/[0.06] dark:bg-green-500/[0.1]",
+    text: "text-green-700 dark:text-green-300",
+    Icon: CheckCircle2,
+  },
+  caution: {
+    label: "Consume with caution",
+    card: "border-amber-500/50 bg-amber-500/[0.06] dark:bg-amber-500/[0.1]",
+    text: "text-amber-700 dark:text-amber-300",
+    Icon: AlertTriangle,
+  },
+  avoid: {
+    label: "Avoid this product",
+    card: "border-red-500/60 bg-red-500/[0.06] dark:bg-red-500/[0.1]",
+    text: "text-red-700 dark:text-red-300",
+    Icon: XCircle,
+  },
+};
+
+/** The top-of-results verdict card: big call, one-line reason, score gauge. */
+function VerdictCard({ a, save }: { a: ProductAnalysis; save: SaveState }) {
+  const m = VERDICT_META[a.verdict] ?? VERDICT_META.caution;
+  const score = a.overall_assessment?.safety_score;
+  return (
+    <section className={`flex flex-col gap-3 rounded-2xl border-2 p-5 ${m.card}`}>
+      <p className="text-xs font-medium text-zinc-500">
+        {a.product_info?.name ?? "Product name not readable"}
+        {a.product_info?.brand ? ` · ${a.product_info.brand}` : ""}
+      </p>
+      <div className="flex items-center justify-between gap-4">
+        <div className="min-w-0">
+          <p
+            className={`flex items-center gap-2 text-lg font-extrabold leading-tight ${m.text}`}
+          >
+            <m.Icon className="h-5 w-5 shrink-0" aria-hidden />
+            {m.label}
+          </p>
+          {a.verdict_reason && (
+            <p className="mt-1.5 text-sm text-zinc-700 dark:text-zinc-300">
+              {a.verdict_reason}
+            </p>
+          )}
+        </div>
+        {typeof score === "number" && (
+          <div className="shrink-0">
+            <SafetyGauge score={score} />
+          </div>
+        )}
+      </div>
+      <SaveNote save={save} />
+    </section>
+  );
+}
+
+/** Persistent "View extracted text" control — visible during analysis and after. */
+function ExtractedTextControl({
+  extracted,
+  open,
+  canReanalyse,
+  draft,
+  busy,
+  onOpen,
+  onClose,
+  onDraft,
+  onReanalyse,
+}: {
+  extracted: { text: string; tier: Tier };
+  open: boolean;
+  canReanalyse: boolean;
+  draft: string;
+  busy: boolean;
+  onOpen: () => void;
+  onClose: () => void;
+  onDraft: (v: string) => void;
+  onReanalyse: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="flex justify-end">
+        <button
+          type="button"
+          onClick={open ? onClose : onOpen}
+          aria-expanded={open}
+          className="inline-flex items-center gap-1.5 rounded-full border border-zinc-200 px-3 py-1.5 text-xs font-medium text-zinc-600 hover:text-foreground dark:border-white/10 dark:text-zinc-400"
+        >
+          <PencilLine className="h-3.5 w-3.5" aria-hidden />
+          {open ? "Hide extracted text" : "📝 View extracted text"}
+        </button>
+      </div>
+
+      {open && (
+        <div className="rounded-2xl border border-zinc-200 p-4 dark:border-white/10">
+          <p className="text-xs text-zinc-500">
+            Read by: {readByLabel(extracted.tier)}
+          </p>
+          <textarea
+            value={draft}
+            onChange={(e) => onDraft(e.target.value)}
+            rows={8}
+            spellCheck={false}
+            className="mt-2 w-full resize-y rounded-xl border border-zinc-300 bg-transparent px-3 py-2 font-mono text-[12px] leading-relaxed text-foreground dark:border-white/15"
+          />
+          <p className="mt-2 text-xs text-zinc-500">
+            Spot a mistake? Fix it and re-analyse.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={onReanalyse}
+              disabled={busy || !canReanalyse || !draft.trim()}
+              className="inline-flex items-center gap-2 rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white disabled:opacity-60"
+            >
+              {busy ? (
+                <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+              ) : (
+                <RefreshCw className="h-4 w-4" aria-hidden />
+              )}
+              Re-analyse with my corrections
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={busy}
+              className="inline-flex items-center gap-2 rounded-xl border border-zinc-300 px-4 py-2 text-sm font-medium dark:border-white/15"
+            >
+              Cancel
+            </button>
+          </div>
+          {!canReanalyse && (
+            <p className="mt-2 text-[11px] text-zinc-400">
+              You can re-analyse once the current analysis finishes.
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CategoryBanner({
+  analysis,
+  confirmed,
+  editing,
+  pick,
+  reanalyzing,
+  onConfirm,
+  onStartEdit,
+  onCancelEdit,
+  onPick,
+  onReanalyze,
+}: {
+  analysis: ProductAnalysis;
+  confirmed: boolean;
+  editing: boolean;
+  pick: DetectedCategoryId | "";
+  reanalyzing: boolean;
+  onConfirm: () => void;
+  onStartEdit: () => void;
+  onCancelEdit: () => void;
+  onPick: (id: DetectedCategoryId) => void;
+  onReanalyze: (id: DetectedCategoryId) => void;
+}) {
+  const dc = analysis.detected_category;
+  const meta = resolveCategory(dc);
+  const shelfCategory = analysis.product_info?.category;
+  const lowConfidence = dc?.confidence === "low";
+  const showReview = editing || (lowConfidence && !confirmed);
+
+  return (
+    <section
+      className={`flex flex-col gap-2 rounded-2xl border-2 bg-white p-4 dark:bg-white/[0.03] ${meta.accentClass}`}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span
+          className={`inline-flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-semibold ${meta.badgeClass}`}
+        >
+          <span aria-hidden>{meta.emoji}</span>
+          {meta.label}
+        </span>
+        {dc?.confidence && (
+          <span className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">
+            {dc.confidence} confidence
+          </span>
+        )}
+      </div>
+
+      <p className="flex items-start gap-2 text-sm">
+        <Package className="mt-0.5 h-4 w-4 shrink-0 text-zinc-400" aria-hidden />
+        <span>
+          <span className="font-medium">Product type:</span>{" "}
+          {shelfCategory ? `${titleCase(shelfCategory)} — ` : ""}
+          {meta.label}
+        </span>
+      </p>
+      <p className="text-sm text-zinc-600 dark:text-zinc-400">
+        <span className="font-medium">📋 Regulated by:</span> {meta.regulatoryBody}{" "}
+        <span className="text-zinc-500">under {meta.act}</span>
+      </p>
+      {dc?.signals_found && dc.signals_found.length > 0 && (
+        <p className="text-xs text-zinc-500">
+          Detected from: {dc.signals_found.slice(0, 6).join(", ")}
+        </p>
+      )}
+
+      {showReview && (
+        <div className="mt-1 rounded-xl border border-amber-500/40 bg-amber-500/[0.06] p-3">
+          {!editing ? (
+            <>
+              <p className="text-sm font-medium text-amber-900 dark:text-amber-200">
+                We detected this as a {meta.label}. Is that correct?
+              </p>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={onConfirm}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-teal-600 px-3 py-1.5 text-xs font-semibold text-white"
+                >
+                  <CheckCircle2 className="h-3.5 w-3.5" aria-hidden />
+                  Yes, correct
+                </button>
+                <button
+                  type="button"
+                  onClick={onStartEdit}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-semibold dark:border-white/15"
+                >
+                  No, change category
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <label className="flex flex-col gap-1 text-xs font-medium text-amber-900 dark:text-amber-200">
+                Choose the correct category
+                <select
+                  value={pick}
+                  onChange={(e) => onPick(e.target.value as DetectedCategoryId)}
+                  className="rounded-lg border border-zinc-300 bg-transparent px-3 py-2 text-sm text-foreground dark:border-white/15"
+                >
+                  <option value="">Select…</option>
+                  {SELECTABLE_CATEGORIES.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.emoji} {c.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="mt-2 flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  disabled={!pick || reanalyzing}
+                  onClick={() => pick && onReanalyze(pick)}
+                  className="inline-flex items-center gap-1.5 rounded-lg bg-teal-600 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-60"
+                >
+                  {reanalyzing ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden />
+                  ) : (
+                    <RefreshCw className="h-3.5 w-3.5" aria-hidden />
+                  )}
+                  Re-analyze
+                </button>
+                <button
+                  type="button"
+                  onClick={onCancelEdit}
+                  disabled={reanalyzing}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-semibold dark:border-white/15"
+                >
+                  Cancel
+                </button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {!showReview && !lowConfidence && (
+        <button
+          type="button"
+          onClick={onStartEdit}
+          className="self-start text-xs font-medium text-teal-700 underline underline-offset-2 dark:text-teal-300"
+        >
+          Not a {meta.label}? Change category
+        </button>
       )}
     </section>
   );
