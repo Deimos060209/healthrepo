@@ -40,10 +40,25 @@ const MAX_OUTPUT_TOKENS = 4000;
  * every analysis burned the whole budget on a thinking block and returned
  * either truncated JSON or no text block at all — a hard 502 on every scan.
  *
- * This task is schema-constrained extraction against a reference table supplied
- * in the prompt, not open-ended reasoning, so thinking buys nothing here while
- * costing ~2,500 extra output tokens and ~10s of latency per scan. Turn it off
- * explicitly rather than relying on the model default.
+ * DO NOT re-enable this without also moving off the Vercel Hobby plan. Measured
+ * on the heaviest food label with this exact prompt:
+ *
+ *   thinking   max_tokens   stop_reason   output   JSON    latency
+ *   disabled       4,000    end_turn       3,528   OK       27s   <- current
+ *   adaptive       4,000    max_tokens     4,000   FAIL     41s
+ *   adaptive       8,000    max_tokens     8,000   FAIL     69s
+ *   adaptive      12,000    end_turn       8,884   OK       78s
+ *   adaptive      16,000    end_turn       8,358   OK       75s
+ *
+ * Thinking needs >= 12,000 max_tokens to leave room for the JSON, and then runs
+ * ~78s — past `maxDuration` (60, the Hobby cap) AND past the client's 55s
+ * AbortController, so the request dies before it returns. It also takes the
+ * scan from ~Rs 4.9 to ~Rs 11.7 in output tokens. On the 5-series `budget_tokens`
+ * is rejected, so there is no smaller thinking allowance to fall back to.
+ *
+ * The reasoning this route needs is carried by the reference table and the
+ * schema in the prompt: the 37/37 multi-category behavioural checks (including
+ * the category-conditional ingredient ratings) all pass with thinking off.
  */
 const THINKING_OFF = { type: "disabled" } as const;
 

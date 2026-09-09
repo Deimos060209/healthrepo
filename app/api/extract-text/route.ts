@@ -82,6 +82,10 @@ export async function POST(request: Request) {
     const message = await anthropic.messages.create({
       model: HAIKU_MODEL,
       max_tokens: 2000,
+      // This tier only transcribes the label — no reasoning to do. Haiku 4.5
+      // does not think by default, but state it explicitly so a future model
+      // swap cannot start spending this 2,000-token budget on thinking.
+      thinking: { type: "disabled" },
       system: SYSTEM_PROMPT,
       messages: [
         {
