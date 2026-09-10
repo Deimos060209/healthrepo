@@ -109,7 +109,7 @@ The product category has ALREADY been identified — see "ACTIVE CATEGORY" and t
 ANTI-HALLUCINATION — DO NOT INVENT WHAT YOU CANNOT SEE:
 NEVER produce a compliance verdict, safety score, or violation list for information that is not actually present in the extracted text.
 - A mandatory declaration that is not in the text because the text is incomplete or only part of the pack was photographed => status: "not_visible", NOT "missing". "missing" means the label is legible and the declaration is genuinely absent; "not_visible" means you cannot tell.
-- If MORE THAN 3 declarations are "not_visible", do NOT return a compliance score: set overall_assessment.compliance_score to null and overall_assessment.compliance_status to "insufficient_data".
+- COMPLIANCE SCORING: score compliance ONLY from the declarations you can actually assess — the ones with status "present" or "missing". Declarations with status "not_visible" are EXCLUDED from the compliance score entirely and are NEVER counted as failures. A single-panel photo legitimately will not show the MRP, net quantity, manufacture date or unit sale price, and that is not a compliance problem — do not lower the score for it. If every assessable declaration is present and compliant, compliance_score should be high (90-100) even when several others are "not_visible". ONLY when FEWER THAN 2 declarations are assessable (almost the entire label is out of frame) set overall_assessment.compliance_score to null and overall_assessment.compliance_status to "insufficient_data".
 - If NO ingredients were found in the text, do NOT return a safety score: set overall_assessment.safety_score to null and overall_assessment.safety_status to "insufficient_data", and return ingredient_analysis as [].
 - Never infer a product's identity from packaging colours or style. If the brand or product name is not legible in the text, set product_info.name (and brand) to null. NEVER return a guessed name, and NEVER put a hedge or disclaimer inside the name field (no "inferred from…", no "(not confirmed)").
 - When you can see enough to score normally, set safety_status and compliance_status to "ok".
@@ -593,6 +593,70 @@ export async function POST(request: Request) {
       applicable_act: rule.act,
       complaint_portal: rule.complaint_portal,
     };
+
+    // TEMP DEBUG — remove once the "partial scan on every scan" bug is fixed.
+    // Logs the raw model output, the pre-normalize compliance/safety signals,
+    // and the post-normalize gate result. `legal_metrology_compliance` is an
+    // OBJECT keyed by declaration, so we count over Object.values().
+    try {
+      const parsedObj = (parsed ?? {}) as Record<string, unknown>;
+      const parsedOA = (parsedObj.overall_assessment ?? {}) as Record<string, unknown>;
+      const parsedLmc = (parsedObj.legal_metrology_compliance ?? {}) as Record<
+        string,
+        { status?: unknown; present?: unknown } | null
+      >;
+      const lmcEntries = Object.entries(parsedLmc);
+      const statusOf = (v: { status?: unknown } | null) =>
+        typeof v?.status === "string" ? v.status : "(no status field)";
+      const countStatus = (want: string) =>
+        lmcEntries.filter(([, v]) => statusOf(v) === want).length;
+      const na = analysis.overall_assessment ?? ({} as ProductAnalysis["overall_assessment"]);
+      console.log(
+        "ANALYZE_DEBUG",
+        JSON.stringify({
+          detected_category: activeCategory,
+          router_raw: routed, // cause D — the raw Haiku router output
+          extracted_text_length: extractedText.length,
+          extracted_text_first_400: extractedText.slice(0, 400),
+          product_name: parsedObj.product_info
+            ? (parsedObj.product_info as Record<string, unknown>).name
+            : null,
+          // --- model output, BEFORE normalizeAnalysis ---
+          model_safety_score: parsedOA.safety_score ?? null,
+          model_safety_status: parsedOA.safety_status ?? null,
+          model_compliance_score: parsedOA.compliance_score ?? null,
+          model_compliance_status: parsedOA.compliance_status ?? null,
+          model_ingredient_count: Array.isArray(parsedObj.ingredient_analysis)
+            ? parsedObj.ingredient_analysis.length
+            : `NOT_AN_ARRAY (${typeof parsedObj.ingredient_analysis})`,
+          model_verdict: parsedObj.verdict ?? null,
+          lmc_key_count: lmcEntries.length,
+          lmc_not_visible: countStatus("not_visible"),
+          lmc_missing: countStatus("missing"),
+          lmc_present: countStatus("present"),
+          lmc_not_applicable: countStatus("not_applicable"),
+          lmc_statuses: Object.fromEntries(
+            lmcEntries.map(([k, v]) => [k, statusOf(v)]),
+          ),
+          // --- AFTER normalizeAnalysis + enrichAnalysis (what the client sees) ---
+          norm_safety_score: na.safety_score,
+          norm_safety_status: na.safety_status,
+          norm_compliance_score: na.compliance_score,
+          norm_compliance_status: na.compliance_status,
+          norm_ingredient_count: analysis.ingredient_analysis?.length ?? 0,
+          // which gate fired:
+          gate_no_ingredients: (analysis.ingredient_analysis?.length ?? 0) === 0,
+          assessable_compliance_count: Object.values(
+            analysis.legal_metrology_compliance ?? {},
+          ).filter((c) => c.status === "present" || c.status === "missing")
+            .length,
+          gate_compliance_insufficient:
+            na.compliance_status === "insufficient_data",
+        }),
+      );
+    } catch (e) {
+      console.log("ANALYZE_DEBUG log failed:", (e as Error).message);
+    }
   } catch {
     // Distinguish "ran out of room" from "model returned malformed JSON" —
     // the first is a config problem, the second is a model problem.

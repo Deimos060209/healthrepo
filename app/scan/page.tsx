@@ -476,19 +476,21 @@ const isNotApplicable = (item: ComplianceItem) =>
   (!item.present && item.compliant && /not applicable/i.test(item.issue ?? ""));
 
 /**
- * The scan could not read enough of the label to score it honestly — either no
- * ingredients were found, or too many declarations were "not visible". The
- * route/normalizer null the score and set the *_status; treat either signal as
- * insufficient. Such a scan gets the partial-scan screen, no PDF, no save.
+ * The full-screen "Partial scan — we could only read part of this label"
+ * takeover is ONLY for a scan with nothing worth showing: safety could not be
+ * scored because no ingredients were readable.
+ *
+ * An incomplete COMPLIANCE side is NOT this case. A normal single-panel photo
+ * legitimately doesn't show the MRP, net quantity or dates — the safety and
+ * nutrition analysis is still complete and useful, so the results screen is
+ * shown and the compliance section renders its own "couldn't verify every
+ * declaration" state. (Gating the whole screen on compliance was the cause of
+ * every scan showing "partial".)
  */
 function isInsufficientData(a: ProductAnalysis): boolean {
   const oa = a.overall_assessment;
   return (
-    !oa ||
-    oa.safety_score == null ||
-    oa.compliance_score == null ||
-    oa.safety_status === "insufficient_data" ||
-    oa.compliance_status === "insufficient_data"
+    !oa || oa.safety_score == null || oa.safety_status === "insufficient_data"
   );
 }
 
@@ -2747,14 +2749,16 @@ function ComplianceRow({ label, item }: { label: string; item: ComplianceItem })
         ? "issue"
         : isNotApplicable(item)
           ? "na"
-          : "missing";
+          : item.status === "not_visible"
+            ? "not_visible"
+            : "missing";
 
   const icon =
     state === "ok" ? (
       <CheckCircle2 className="h-4 w-4 shrink-0 text-green-500" aria-hidden />
     ) : state === "issue" ? (
       <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" aria-hidden />
-    ) : state === "na" ? (
+    ) : state === "na" || state === "not_visible" ? (
       <Circle className="h-4 w-4 shrink-0 text-zinc-300 dark:text-white/20" aria-hidden />
     ) : (
       <XCircle className="h-4 w-4 shrink-0 text-red-600" aria-hidden />
@@ -2770,11 +2774,16 @@ function ComplianceRow({ label, item }: { label: string; item: ComplianceItem })
             {item.value}
           </p>
         )}
-        {item.issue && state !== "na" && (
+        {item.issue && state !== "na" && state !== "not_visible" && (
           <p className="text-xs text-amber-700 dark:text-amber-400">{item.issue}</p>
         )}
         {state === "missing" && !item.issue && (
           <p className="text-xs text-red-600 dark:text-red-400">Missing from the label</p>
+        )}
+        {state === "not_visible" && (
+          <p className="text-xs text-zinc-500">
+            Not visible in this photo — scan the other panels to check
+          </p>
         )}
       </div>
     </li>

@@ -902,13 +902,15 @@ function ComplianceRow({
         ? "issue"
         : isNotApplicable(item)
           ? "na"
-          : "missing";
+          : item.status === "not_visible"
+            ? "not_visible"
+            : "missing";
   const icon =
     state === "ok" ? (
       <CheckCircle2 className="h-4 w-4 shrink-0 text-green-500" aria-hidden />
     ) : state === "issue" ? (
       <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" aria-hidden />
-    ) : state === "na" ? (
+    ) : state === "na" || state === "not_visible" ? (
       <Circle
         className="h-4 w-4 shrink-0 text-zinc-300 dark:text-white/20"
         aria-hidden
@@ -926,7 +928,7 @@ function ComplianceRow({
             {item.value}
           </p>
         )}
-        {item.issue && state !== "na" && (
+        {item.issue && state !== "na" && state !== "not_visible" && (
           <p className="text-xs text-amber-700 dark:text-amber-400">
             {item.issue}
           </p>
@@ -934,6 +936,11 @@ function ComplianceRow({
         {state === "missing" && !item.issue && (
           <p className="text-xs text-red-600 dark:text-red-400">
             Missing from the label
+          </p>
+        )}
+        {state === "not_visible" && (
+          <p className="text-xs text-zinc-500">
+            Not visible in this photo — scan the other panels to check
           </p>
         )}
       </div>

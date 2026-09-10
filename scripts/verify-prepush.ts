@@ -1171,41 +1171,87 @@ check(
   guard5.overall_assessment.overall_score === null,
 );
 
-// >3 not_visible -> compliance null
+// BUGFIX (partial-scan-on-every-scan): `not_visible` declarations are EXCLUDED
+// from compliance, never a reason to null it. A normal single-panel photo has
+// many not_visible declarations and MUST still produce a compliance score from
+// whatever is assessable.
 const nv = raw({
   ingredients: [{ name: "Sugar", safety_status: "safe", source: "reference_database" }],
   safety: 90,
   compliance: 85,
   flags: [{ nutrient: "Sugar", value_per_100: 5, unit: "g" }],
 });
-const lmc = nv.legal_metrology_compliance as Record<string, Record<string, unknown>>;
-for (const k of ["manufacturer_info", "generic_name", "net_quantity", "manufacture_date"]) {
-  lmc[k] = { present: false, value: null, compliant: false, issue: "cut off", status: "not_visible" };
+const lmcNv = nv.legal_metrology_compliance as Record<string, Record<string, unknown>>;
+// 6 of 11 not visible (the classic back-of-pack photo: MRP/net qty/dates/etc off-panel)
+for (const k of [
+  "net_quantity",
+  "manufacture_date",
+  "best_before_use_by",
+  "mrp",
+  "unit_sale_price",
+  "country_of_origin",
+]) {
+  lmcNv[k] = { present: false, value: null, compliant: false, issue: null, status: "not_visible" };
 }
 const nvOut = run(nv, "food_and_beverages");
 check(
-  "5.6 four not_visible declarations -> compliance_score null + insufficient_data",
-  nvOut.overall_assessment.compliance_score === null &&
-    nvOut.overall_assessment.compliance_status === "insufficient_data",
+  "6 not_visible + 5 assessable -> compliance STILL scored (was the bug: this used to null)",
+  nvOut.overall_assessment.compliance_score === 85 &&
+    nvOut.overall_assessment.compliance_status === "ok",
+  `score=${nvOut.overall_assessment.compliance_score} status=${nvOut.overall_assessment.compliance_status}`,
 );
 check(
-  "compliance null -> overall_score null",
-  nvOut.overall_assessment.overall_score === null,
+  "-> overall_score computes normally (not null)",
+  nvOut.overall_assessment.overall_score != null,
+  `overall=${nvOut.overall_assessment.overall_score}`,
 );
-// exactly 3 must still score
-const nv3 = raw({
+
+// Only when FEWER THAN 2 declarations are assessable is compliance insufficient.
+const frag = raw({
   ingredients: [{ name: "Sugar", safety_status: "safe", source: "reference_database" }],
   safety: 90,
   compliance: 85,
   flags: [{ nutrient: "Sugar", value_per_100: 5, unit: "g" }],
 });
-const lmc3 = nv3.legal_metrology_compliance as Record<string, Record<string, unknown>>;
-for (const k of ["manufacturer_info", "generic_name", "net_quantity"]) {
-  lmc3[k] = { present: false, value: null, compliant: false, issue: "cut off", status: "not_visible" };
+const lmcFrag = frag.legal_metrology_compliance as Record<string, Record<string, unknown>>;
+// everything not_visible except ONE present -> assessable count 1 -> insufficient
+for (const k of Object.keys(lmcFrag)) {
+  lmcFrag[k] = { present: false, value: null, compliant: false, issue: null, status: "not_visible" };
 }
+lmcFrag.fssai_license = {
+  present: true,
+  value: "10012345678901",
+  compliant: true,
+  issue: null,
+  status: "present",
+};
+const fragOut = run(frag, "food_and_beverages");
 check(
-  "exactly 3 not_visible still scores (boundary is > 3)",
-  run(nv3, "food_and_beverages").overall_assessment.compliance_score === 85,
+  "only 1 assessable declaration -> compliance_score null + insufficient_data",
+  fragOut.overall_assessment.compliance_score === null &&
+    fragOut.overall_assessment.compliance_status === "insufficient_data",
+  `score=${fragOut.overall_assessment.compliance_score} status=${fragOut.overall_assessment.compliance_status}`,
+);
+check(
+  "compliance null -> overall_score null",
+  fragOut.overall_assessment.overall_score === null,
+);
+// A genuinely 'missing' declaration is assessable and does NOT trip insufficiency.
+const miss = raw({
+  ingredients: [{ name: "Sugar", safety_status: "safe", source: "reference_database" }],
+  safety: 90,
+  compliance: 60,
+  flags: [{ nutrient: "Sugar", value_per_100: 5, unit: "g" }],
+});
+const lmcMiss = miss.legal_metrology_compliance as Record<string, Record<string, unknown>>;
+for (const k of Object.keys(lmcMiss)) {
+  lmcMiss[k] = { present: false, value: null, compliant: false, issue: null, status: "not_visible" };
+}
+lmcMiss.mrp = { present: false, value: null, compliant: false, issue: "Genuinely absent from a legible label", status: "missing" };
+lmcMiss.net_quantity = { present: false, value: null, compliant: false, issue: "Genuinely absent", status: "missing" };
+check(
+  "2 'missing' (legible label, declaration truly absent) -> compliance scored, non-insufficient",
+  run(miss, "food_and_beverages").overall_assessment.compliance_score === 60,
 );
 check(
   "5.10 illegible product name stays null, not a guess",

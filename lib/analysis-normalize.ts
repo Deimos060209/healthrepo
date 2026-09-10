@@ -432,11 +432,15 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
     };
   }
 
-  // "Not visible" declarations mean the photo only caught part of the pack.
-  // Past a handful of them a compliance verdict is dishonest — the route/prompt
-  // is told to null the score, and this enforces it even if the model forgot.
-  const notVisibleCount = Object.values(legal_metrology_compliance).filter(
-    (c) => c.status === "not_visible",
+  // Compliance is scored from the declarations that can actually be assessed
+  // (status "present" or "missing"). "not_visible" declarations — the off-panel
+  // MRP / net quantity / dates on a normal single-photo scan — are simply
+  // excluded, NOT a reason to discard the whole compliance verdict. It is only
+  // "insufficient" when barely anything on the label was captured at all.
+  const assessableComplianceCount = Object.values(
+    legal_metrology_compliance,
+  ).filter(
+    (c) => c.status === "present" || c.status === "missing",
   ).length;
 
   const ingredient_analysis: IngredientAnalysis[] = (
@@ -469,7 +473,7 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
   const complianceInsufficient =
     rawCompliance === null ||
     /insufficient/i.test(String(oa.compliance_status ?? "")) ||
-    notVisibleCount > 3;
+    assessableComplianceCount < 2;
 
   const overall_assessment: OverallAssessment = {
     safety_score: safetyInsufficient ? null : rawSafety,
