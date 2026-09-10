@@ -475,6 +475,43 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
     /insufficient/i.test(String(oa.compliance_status ?? "")) ||
     assessableComplianceCount < 2;
 
+  // TEMP DEBUG — log which exact sub-condition nulled a score. Remove with the
+  // ANALYZE_DEBUG / HAIKU_ROUTER_DEBUG logging in app/api/analyze/route.ts.
+  if (safetyInsufficient || complianceInsufficient) {
+    // eslint-disable-next-line no-console
+    console.log(
+      "INSUFFICIENT_GATE_DEBUG",
+      JSON.stringify({
+        safety_insufficient: safetyInsufficient,
+        safety_trigger: safetyInsufficient
+          ? rawSafety === null
+            ? `rawSafety===null (model sent ${JSON.stringify(oa.safety_score)})`
+            : /insufficient/i.test(String(oa.safety_status ?? ""))
+              ? `model safety_status="${oa.safety_status}"`
+              : `ingredient_analysis.length===0`
+          : null,
+        compliance_insufficient: complianceInsufficient,
+        compliance_trigger: complianceInsufficient
+          ? rawCompliance === null
+            ? `rawCompliance===null (model sent ${JSON.stringify(oa.compliance_score)})`
+            : /insufficient/i.test(String(oa.compliance_status ?? ""))
+              ? `model compliance_status="${oa.compliance_status}"`
+              : `assessableComplianceCount<2 (was ${assessableComplianceCount})`
+          : null,
+        raw_safety_score: rawSafety,
+        raw_compliance_score: rawCompliance,
+        ingredient_count: ingredient_analysis.length,
+        assessable_compliance_count: assessableComplianceCount,
+        lmc_statuses: Object.fromEntries(
+          Object.entries(legal_metrology_compliance).map(([k, v]) => [
+            k,
+            v.status,
+          ]),
+        ),
+      }),
+    );
+  }
+
   const overall_assessment: OverallAssessment = {
     safety_score: safetyInsufficient ? null : rawSafety,
     compliance_score: complianceInsufficient ? null : rawCompliance,

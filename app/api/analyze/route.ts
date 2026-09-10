@@ -321,10 +321,11 @@ async function routeCategory(text: string): Promise<{
       .join("");
     const parsed = extractJson(raw) as Record<string, unknown>;
     const conf = String(parsed?.confidence ?? "").toLowerCase();
-    return {
+    const result = {
       category: String(parsed?.category ?? "unknown"),
-      confidence:
-        conf === "high" || conf === "medium" || conf === "low" ? conf : "low",
+      confidence: (conf === "high" || conf === "medium" || conf === "low"
+        ? conf
+        : "low") as "high" | "medium" | "low",
       signals: Array.isArray(parsed?.signals)
         ? parsed.signals
             .filter((s): s is string => typeof s === "string")
@@ -332,6 +333,18 @@ async function routeCategory(text: string): Promise<{
         : [],
       detected: typeof parsed?.detected === "string" ? parsed.detected.trim() : "",
     };
+    // TEMP DEBUG — the raw Haiku category-router output. Remove with ANALYZE_DEBUG.
+    console.log(
+      "HAIKU_ROUTER_DEBUG",
+      JSON.stringify({
+        category: result.category,
+        confidence: result.confidence,
+        signals: result.signals,
+        detected: result.detected,
+        raw_reply: raw.slice(0, 600),
+      }),
+    );
+    return result;
   } catch (err) {
     // A hard outage (out of credits, broken key) will hit the Sonnet call too —
     // surface it now rather than burning the expensive step to rediscover it.
@@ -594,64 +607,79 @@ export async function POST(request: Request) {
       complaint_portal: rule.complaint_portal,
     };
 
-    // TEMP DEBUG — remove once the "partial scan on every scan" bug is fixed.
-    // Logs the raw model output, the pre-normalize compliance/safety signals,
-    // and the post-normalize gate result. `legal_metrology_compliance` is an
-    // OBJECT keyed by declaration, so we count over Object.values().
+    // TEMP DEBUG — diagnoses why a full label gets classified insufficient_data.
+    // Remove (with HAIKU_ROUTER_DEBUG and INSUFFICIENT_GATE_DEBUG) once verified
+    // on the live site. NOTE: `legal_metrology_compliance` is an OBJECT keyed by
+    // declaration name, not an array — counts are over Object.values(); a
+    // per-item `status` is "present" | "missing" | "not_visible" |
+    // "not_applicable" (there is no "ok" at item level — that is the overall
+    // compliance_status), so `ok_count` here means present-and-compliant.
     try {
       const parsedObj = (parsed ?? {}) as Record<string, unknown>;
-      const parsedOA = (parsedObj.overall_assessment ?? {}) as Record<string, unknown>;
+      const parsedOA = (parsedObj.overall_assessment ?? {}) as Record<
+        string,
+        unknown
+      >;
       const parsedLmc = (parsedObj.legal_metrology_compliance ?? {}) as Record<
         string,
-        { status?: unknown; present?: unknown } | null
+        { status?: unknown; present?: unknown; compliant?: unknown } | null
       >;
-      const lmcEntries = Object.entries(parsedLmc);
+      const lmcItems = Object.values(parsedLmc);
       const statusOf = (v: { status?: unknown } | null) =>
         typeof v?.status === "string" ? v.status : "(no status field)";
       const countStatus = (want: string) =>
-        lmcEntries.filter(([, v]) => statusOf(v) === want).length;
-      const na = analysis.overall_assessment ?? ({} as ProductAnalysis["overall_assessment"]);
+        lmcItems.filter((v) => statusOf(v) === want).length;
+      const parsedNa = (parsedObj.nutritional_analysis ?? {}) as Record<
+        string,
+        unknown
+      >;
+      const na =
+        analysis.overall_assessment ??
+        ({} as ProductAnalysis["overall_assessment"]);
       console.log(
         "ANALYZE_DEBUG",
         JSON.stringify({
           detected_category: activeCategory,
-          router_raw: routed, // cause D — the raw Haiku router output
-          extracted_text_length: extractedText.length,
-          extracted_text_first_400: extractedText.slice(0, 400),
-          product_name: parsedObj.product_info
-            ? (parsedObj.product_info as Record<string, unknown>).name
-            : null,
-          // --- model output, BEFORE normalizeAnalysis ---
-          model_safety_score: parsedOA.safety_score ?? null,
-          model_safety_status: parsedOA.safety_status ?? null,
-          model_compliance_score: parsedOA.compliance_score ?? null,
-          model_compliance_status: parsedOA.compliance_status ?? null,
-          model_ingredient_count: Array.isArray(parsedObj.ingredient_analysis)
+          extracted_text_length: extractedText?.length,
+          extracted_text_preview: extractedText?.slice(0, 500),
+          product_name: (parsedObj.product_info as Record<string, unknown>)?.name,
+          safety_score: parsedOA.safety_score,
+          compliance_score: parsedOA.compliance_score,
+          compliance_status: parsedOA.compliance_status,
+          safety_status: parsedOA.safety_status,
+          not_visible_count: countStatus("not_visible"),
+          missing_count: countStatus("missing"),
+          ok_count: lmcItems.filter(
+            (v) => statusOf(v) === "present" && v?.compliant === true,
+          ).length,
+          present_count: countStatus("present"),
+          not_applicable_count: countStatus("not_applicable"),
+          lmc_key_count: lmcItems.length,
+          lmc_statuses: Object.fromEntries(
+            Object.entries(parsedLmc).map(([k, v]) => [k, statusOf(v)]),
+          ),
+          ingredient_count: Array.isArray(parsedObj.ingredient_analysis)
             ? parsedObj.ingredient_analysis.length
             : `NOT_AN_ARRAY (${typeof parsedObj.ingredient_analysis})`,
-          model_verdict: parsedObj.verdict ?? null,
-          lmc_key_count: lmcEntries.length,
-          lmc_not_visible: countStatus("not_visible"),
-          lmc_missing: countStatus("missing"),
-          lmc_present: countStatus("present"),
-          lmc_not_applicable: countStatus("not_applicable"),
-          lmc_statuses: Object.fromEntries(
-            lmcEntries.map(([k, v]) => [k, statusOf(v)]),
-          ),
-          // --- AFTER normalizeAnalysis + enrichAnalysis (what the client sees) ---
-          norm_safety_score: na.safety_score,
-          norm_safety_status: na.safety_status,
-          norm_compliance_score: na.compliance_score,
-          norm_compliance_status: na.compliance_status,
-          norm_ingredient_count: analysis.ingredient_analysis?.length ?? 0,
-          // which gate fired:
-          gate_no_ingredients: (analysis.ingredient_analysis?.length ?? 0) === 0,
+          early_verdict: parsedObj.verdict ?? null,
+          nutrition_score: parsedNa.nutrition_score ?? null,
+          // ---- what the client actually receives, AFTER normalize + enrich ----
+          final_safety_score: na.safety_score,
+          final_safety_status: na.safety_status,
+          final_compliance_score: na.compliance_score,
+          final_compliance_status: na.compliance_status,
+          final_nutrition_score: na.nutrition_score ?? null,
+          final_overall_score: na.overall_score ?? null,
+          final_verdict: analysis.verdict,
+          final_ingredient_count: analysis.ingredient_analysis?.length ?? 0,
           assessable_compliance_count: Object.values(
             analysis.legal_metrology_compliance ?? {},
           ).filter((c) => c.status === "present" || c.status === "missing")
             .length,
+          gate_no_ingredients: (analysis.ingredient_analysis?.length ?? 0) === 0,
           gate_compliance_insufficient:
             na.compliance_status === "insufficient_data",
+          gate_safety_insufficient: na.safety_status === "insufficient_data",
         }),
       );
     } catch (e) {
