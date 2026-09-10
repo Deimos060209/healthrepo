@@ -27,7 +27,14 @@ export interface SafeProductRow {
   category: string | null;
   detected_category?: DetectedCategory | null;
   image_url: string | null;
+  /** Weighted overall for v2 rows; legacy safety score for v1 rows. */
   overall_score: number | null;
+  /** scoring-model-v2 columns — absent when the RPC predates migration 20260909040000. */
+  safety_score?: number | null;
+  nutrition_score?: number | null;
+  compliance_score?: number | null;
+  verdict?: string | null;
+  scan_version?: number | null;
   compliance_status: string | null;
   ingredient_analysis: IngredientAnalysis[] | Record<string, never> | null;
   times_scanned: number | string | null;
@@ -80,10 +87,21 @@ const toCount = (v: number | string | null | undefined): number => {
  * Collapse many scan rows into one card per product (name + brand), keeping the
  * highest-scoring scan as the representative and the largest `times_scanned`.
  */
+/** The nutrition floor the search promises — matches migration 20260909040000. */
+export const SAFE_PRODUCT_NUTRITION_FLOOR = 60;
+
 export function dedupeSafeProducts(rows: SafeProductRow[]): SafeProduct[] {
   const byKey = new Map<string, SafeProduct>();
   for (const r of rows) {
     if (!r.product_name) continue;
+    // Belt-and-braces: the RPC already enforces this, but skip a nutritionally
+    // poor product here too in case an older function is still deployed.
+    if (
+      typeof r.nutrition_score === "number" &&
+      r.nutrition_score < SAFE_PRODUCT_NUTRITION_FLOOR
+    ) {
+      continue;
+    }
     const key = `${r.product_name.trim().toLowerCase()}|${(r.brand ?? "")
       .trim()
       .toLowerCase()}`;

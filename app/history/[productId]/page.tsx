@@ -37,8 +37,11 @@ import type {
   DosageAnalysis,
   DetectedCategory,
   PersonalFlag,
+  NutritionalAnalysis,
+  Verdict,
 } from "@/types/analysis";
 import type { StoredAlternative } from "@/types/database";
+import { NutritionSection } from "@/components/NutritionSection";
 
 // ---------------------------------------------------------------------------
 // Row shape + helpers
@@ -58,7 +61,40 @@ interface ScanRow {
   personal_alerts: PersonalFlag[] | null;
   healthier_alternatives: StoredAlternative[] | null;
   overall_score: number | null;
+  /** scoring-model-v2 columns — null / {} on rows scored before the nutrition layer. */
+  safety_score: number | null;
+  nutrition_score: number | null;
+  compliance_score: number | null;
+  verdict: string | null;
+  nutritional_analysis: NutritionalAnalysis | Record<string, never> | null;
+  primary_concern: Record<string, unknown> | null;
+  scan_version: number | null;
   scanned_at: string;
+}
+
+const BASE_COLS =
+  "id, product_name, brand, category, detected_category, image_url, compliance_status, compliance_details, ingredient_analysis, dosage_analysis, personal_alerts, healthier_alternatives, overall_score, scanned_at";
+const V2_COLS = `${BASE_COLS}, safety_score, nutrition_score, compliance_score, verdict, nutritional_analysis, primary_concern, scan_version`;
+
+function isUnknownColumn(e: { code?: string; message?: string } | null): boolean {
+  if (!e) return false;
+  if (e.code === "42703" || e.code === "PGRST204") return true;
+  return /column .* does not exist|could not find the .* column/i.test(
+    e.message ?? "",
+  );
+}
+
+/** True when this row carries the full scoring-model-v2 nutrition layer. */
+function isV2(row: ScanRow): boolean {
+  return (row.scan_version ?? 1) >= 2 && row.safety_score != null;
+}
+
+/** The stored nutritional_analysis, or null when it is absent / an empty {}. */
+function storedNutrition(row: ScanRow): NutritionalAnalysis | null {
+  const n = row.nutritional_analysis;
+  if (!n || typeof n !== "object") return null;
+  if (!("food_type" in n) && !("concerns" in n)) return null; // {} placeholder
+  return n as NutritionalAnalysis;
 }
 
 const DECLARATION_LABELS: Record<string, string> = {
@@ -175,11 +211,25 @@ function deriveAlternatives(row: ScanRow): StoredAlternative[] {
     });
 }
 
+const VERDICTS: readonly string[] = ["safe", "caution", "limit", "avoid"];
+
 function rowToAnalysis(row: ScanRow): ProductAnalysis {
   const cd = row.compliance_details ?? {};
   const ing = row.ingredient_analysis ?? [];
   const bannedN = ing.filter((i) => i.safety_status === "banned").length;
   const harmfulN = ing.filter((i) => i.safety_status === "harmful").length;
+  const v2 = isV2(row);
+  const nutrition = storedNutrition(row);
+  // v2: overall_score is the weighted blend, and safety/nutrition/compliance
+  // were stored separately. v1: overall_score is the legacy safety value.
+  const safety = v2 ? row.safety_score : row.overall_score;
+  const compliance = v2
+    ? (row.compliance_score ?? complianceScore(row.compliance_details))
+    : complianceScore(row.compliance_details);
+  const verdict =
+    v2 && row.verdict && VERDICTS.includes(row.verdict)
+      ? (row.verdict as Verdict)
+      : normalizeVerdict(null, row.overall_score ?? null, bannedN, harmfulN);
   return {
     product_info: {
       name: row.product_name ?? null,
@@ -196,7 +246,7 @@ function rowToAnalysis(row: ScanRow): ProductAnalysis {
       country_of_origin: cd.country_of_origin?.value ?? null,
     },
     detected_category: normalizeDetectedCategory(row.detected_category),
-    verdict: normalizeVerdict(null, row.overall_score ?? null, bannedN, harmfulN),
+    verdict,
     verdict_reason: "",
     key_findings: [],
     legal_metrology_compliance: cd,
@@ -205,12 +255,15 @@ function rowToAnalysis(row: ScanRow): ProductAnalysis {
       personal_flags: Array.isArray(ing.personal_flags) ? ing.personal_flags : [],
     })),
     dosage_analysis: normalizeDosageAnalysis(row.dosage_analysis),
+    nutritional_analysis: nutrition,
     personal_alerts: Array.isArray(row.personal_alerts)
       ? row.personal_alerts
       : [],
     overall_assessment: {
-      safety_score: row.overall_score ?? 0,
-      compliance_score: complianceScore(row.compliance_details),
+      safety_score: safety ?? 0,
+      nutrition_score: v2 ? (row.nutrition_score ?? null) : null,
+      compliance_score: compliance,
+      overall_score: row.overall_score ?? null,
       summary: "",
       recommendation: "",
     },
@@ -251,14 +304,25 @@ export default function HistoryDetailPage({
       if (!alive) return;
       if (!user) return setState("notfound");
 
-      const { data, error } = await supabase
+      const q1 = await supabase
         .from("scanned_products")
-        .select(
-          "id, product_name, brand, category, detected_category, image_url, compliance_status, compliance_details, ingredient_analysis, dosage_analysis, personal_alerts, healthier_alternatives, overall_score, scanned_at",
-        )
+        .select(V2_COLS)
         .eq("id", productId)
         .eq("user_id", user.id)
         .maybeSingle();
+      let data: unknown = q1.data;
+      let error = q1.error;
+      // Pre-migration DB: retry with just the columns it knows.
+      if (error && isUnknownColumn(error)) {
+        const q2 = await supabase
+          .from("scanned_products")
+          .select(BASE_COLS)
+          .eq("id", productId)
+          .eq("user_id", user.id)
+          .maybeSingle();
+        data = q2.data;
+        error = q2.error;
+      }
       if (!alive) return;
       if (error) return setState("error");
       if (!data) return setState("notfound");
@@ -279,6 +343,8 @@ export default function HistoryDetailPage({
     const safe = ingredients.filter((i) => i.safety_status === "safe");
     return {
       ingredients,
+      v2: isV2(row),
+      nutrition: storedNutrition(row),
       harmful,
       banned,
       caution,
@@ -322,9 +388,9 @@ export default function HistoryDetailPage({
   async function handleShare() {
     if (!row) return;
     const url = `${window.location.origin}/history/${row.id}`;
-    const text = `${row.product_name} scored ${
-      row.overall_score ?? "?"
-    }/100 for safety on HealthRepo.`;
+    const text = `${row.product_name} scored ${row.overall_score ?? "?"}/100 ${
+      isV2(row) ? "overall" : "for safety"
+    } on HealthRepo.`;
     try {
       if (typeof navigator !== "undefined" && navigator.share) {
         await navigator.share({
@@ -433,7 +499,59 @@ export default function HistoryDetailPage({
           />
         )}
         <SafetyGauge score={row.overall_score ?? 0} />
+        {derived.v2 ? (
+          <div className="flex gap-2">
+            {(
+              [
+                ["Safety", row.safety_score],
+                ["Nutrition", row.nutrition_score],
+                ["Compliance", row.compliance_score],
+              ] as [string, number | null][]
+            ).map(([label, val]) => (
+              <span
+                key={label}
+                className={`flex flex-col items-center rounded-lg px-2.5 py-1 text-center ${
+                  val == null
+                    ? "bg-zinc-100 text-zinc-400 dark:bg-white/5"
+                    : val >= 80
+                      ? "bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300"
+                      : val >= 50
+                        ? "bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300"
+                        : "bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-300"
+                }`}
+              >
+                <span className="text-sm font-bold tabular-nums">
+                  {val == null ? "—" : Math.round(val)}
+                </span>
+                <span className="text-[9px] font-semibold uppercase tracking-wide">
+                  {label}
+                </span>
+              </span>
+            ))}
+          </div>
+        ) : (
+          <p className="text-[11px] text-zinc-400">
+            Scanned before nutritional analysis was added — this is the safety
+            score only.
+          </p>
+        )}
       </section>
+
+      {/* Nutritional quality — same section as the scan results page */}
+      {derived.v2 && derived.nutrition && (
+        <Expander
+          title="Nutritional quality"
+          open={open.has("nutrition")}
+          onToggle={() => toggle("nutrition")}
+        >
+          <NutritionSection n={derived.nutrition} />
+        </Expander>
+      )}
+      {derived.v2 && !derived.nutrition && row.nutrition_score == null && (
+        <section className="rounded-2xl border border-zinc-200 p-4 text-sm text-zinc-500 dark:border-white/10">
+          Nutritional quality is not assessed for this product category.
+        </section>
+      )}
 
       {/* Key highlights */}
       <section className="flex flex-col gap-2 rounded-2xl border border-zinc-200 p-4 dark:border-white/10">

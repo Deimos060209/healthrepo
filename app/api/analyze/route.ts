@@ -7,7 +7,12 @@ import {
   normalizeCompactCategory,
 } from "@/lib/reference-data";
 import { normalizeAnalysis } from "@/lib/analysis-normalize";
-import { enrichAnalysis } from "@/lib/enrich-analysis";
+import { enrichAnalysis, nutritionPersonalAlerts } from "@/lib/enrich-analysis";
+import {
+  anthropicPreflight,
+  handleAnthropicError,
+  isHardAnthropicOutage,
+} from "@/lib/anthropic-errors";
 import type {
   AnalyzeRequestBody,
   DetectedCategoryId,
@@ -27,12 +32,24 @@ export const dynamic = "force-dynamic";
  * returns only the ingredients actually detected, and the summary is capped at
  * 3 sentences.
  *
- * Measured with THINKING_OFF below: a personal-care label lands ~2,500 output
- * tokens and a heavily-additive food label ~3,400. 3,000 truncated the food
- * case mid-JSON (stop_reason "max_tokens" -> unparseable), so this is 4,000:
- * ~1.2x headroom over the worst case measured, still well inside `maxDuration`.
+ * MEASURED (thinking off, live API, scripts/measure-nutrition-tokens.ts,
+ * 2026-09-10) WITH the nutritional layer active — it roughly doubled output:
+ *
+ *   label                         output tokens   stop
+ *   personal-care (pre-nutrition)    ~2,500        end_turn
+ *   food, heavy additives (pre-)     ~3,528        end_turn
+ *   realistic 8-ingredient snack      4,164        end_turn
+ *     + health profile                4,438        end_turn
+ *   common 15-ingredient noodles      6,037        end_turn   <-- 502s at 5,500
+ *   24-ingredient biscuit           >= 5,500       (>= mid)
+ *
+ * 5,500 is NOT over-provisioned — it truncates a Maggi-class label mid-JSON,
+ * and route.ts turns that into a 502. 7,000 clears the measured worst
+ * (6,076) with ~15% headroom. The cap is a ceiling billed per token
+ * generated, so a scan that stops at 4,200 costs the same at 7,000 as at
+ * 4,000 — raising it only rescues the labels that need the room.
  */
-const MAX_OUTPUT_TOKENS = 4000;
+const MAX_OUTPUT_TOKENS = 7000;
 
 /**
  * Extended thinking is ON BY DEFAULT for claude-sonnet-5, and its thinking
@@ -115,6 +132,50 @@ Also return 'ingredients_not_in_database' for every ingredient you flagged from 
 DOSAGE AND LIMIT CHECKING (food categories only — for personal_care / household_cleaning return additive_count zeroed, limit_checks [], cumulative_risk 'low', daily_intake_warning null, combination_warnings []):
 For each additive in the ingredients list, match it against fssai_limits (name / also_known_as / e_code / ins_code) and use the special_limits entry for this product type where one applies, otherwise fssai_max_limit_mg_per_kg (null = permitted at GMP). If the label declares a quantity, compare and set 'within_limit' / 'exceeds_limit'; otherwise 'quantity_not_declared'. Add a combination_warnings entry when several preservatives or several colours are present, or for benzoate + ascorbic acid. Where an ADI and a declared or estimable concentration exist, compute how much of the product a 60 kg adult can safely have per day and put it in daily_intake_warning (assume a 600 ml bottle / 250 ml glass for drinks, a 50 g pack for snacks); otherwise null.
 
+NUTRITIONAL ASSESSMENT — FOOD CATEGORIES ONLY (food_and_beverages, baby_product_food). Do this IN ADDITION to the safety analysis. For personal_care, household_cleaning and baby_product_care, omit nutritional_analysis entirely.
+
+A product with no banned substances and no harmful additives is NOT automatically healthy. Assess nutritional quality separately.
+
+CONTEXT: This app serves Indian consumers. Rice, wheat, pulses and cooking oils are dietary staples eaten daily by hundreds of millions of people as part of balanced meals with dal, vegetables and dairy. Do NOT moralise about staple foods. A bag of white rice is not a health hazard — it is a normal, affordable food. Note honestly that brown rice or hand-pounded rice retains more fibre, but never frame plain rice as something to avoid. Reserve strong negative language for genuinely problematic products: ultra-processed foods, sugar-sweetened beverages, trans fats, and products with harmful additives. The tone for a staple should be informative, not corrective.
+
+FOOD TYPE CLASSIFICATION — determine this before nutritional scoring:
+- 'staple_ingredient' — a basic cooking ingredient, typically 1-3 ingredients, that a person combines with other foods to make a meal. Rice, wheat flour, pulses, plain pasta, oils, sugar, salt, spices, plain dairy, eggs. The consumer controls how it is used.
+- 'minimally_processed' — a recognisable whole food with light processing. Plain yoghurt, paneer, roasted nuts, dried fruit, canned beans in water, frozen vegetables.
+- 'processed_product' — a manufactured item eaten as-is or after heating, with a formulated recipe. Biscuits, chips, sauces, breakfast cereals, instant noodles, ready meals, beverages, confectionery.
+The distinction is WHO controls the final dish. A bag of rice is a staple — the eater decides what goes with it. A packet of instant noodles is a product — the manufacturer decided. Return food_type and a one-line food_type_reason. The server scores staples on a gentler scale (no density cap, no ultra-processing penalty, halved ingredient penalties, a floor of 60) and keeps the strict rules for processed products, so this classification directly governs how the food is judged.
+
+Check every ingredient against nutritional_concerns in the COMPACT REFERENCE DATA. Refined grains, added sugars in any form, refined and hydrogenated oils, high sodium and processed meats must be flagged even though they are perfectly legal and additive-free.
+
+Read the nutritional information panel if present and report every value you can see, per 100 g (solids) or per 100 ml (beverages), in threshold_flags — sugar, sodium (or salt), saturated fat, total fat, trans fat, fibre. Report the NUMBER you read; the server assigns the band ('low' / 'medium' / 'medium_high' / 'high' / 'very_high') and the penalty, and applies hard score ceilings for products that are extreme in a single nutrient.
+
+Count distinct sugar aliases. Three or more means sugar is split across names.
+
+Judge ingredient ORDER — ingredients are listed by descending weight. If sugar or refined flour appears in the first three, say so explicitly in ingredient_order_note.
+
+Assess processing level: more than 10 ingredients with 3 or more additives means ultra-processed.
+
+NUTRIENT DENSITY:
+Beyond checking for problems, assess what this food actually provides. Classify it as one of:
+- 'high' — whole grains, legumes, nuts, seeds, plain dairy, eggs, fresh produce, minimally processed foods that deliver meaningful fibre, protein, vitamins or minerals
+- 'moderate' — foods with some nutritional value but notable refinement or processing, or a narrow nutrient profile
+- 'low' — refined grains, refined starches, refined oils and sugars as primary ingredients; foods providing mainly calories with little fibre or micronutrient content
+- 'empty' — products that are essentially sugar, refined starch or fat with negligible nutritional contribution (soft drinks, boiled sweets, plain refined-flour snacks)
+Return nutrient_density and a one-sentence density_note explaining the classification. Judge by the PRIMARY ingredients — the first three by weight — not by trace additions. A pasta whose sole ingredient is refined semolina is 'low' density regardless of how clean its label is. A single-ingredient product is not automatically nutritious; a clean label and a nutritious food are different things. The server applies density-based score ceilings to processed and minimally-processed foods (empty -> 35, low -> 75, moderate -> 88, high -> uncapped) — density is NOT a ceiling for staple ingredients.
+
+POSITIVE NUTRITION: also note what the food actively provides. The server awards bonuses for fibre and protein content, for a whole grain / pulse / nuts / plain fermented dairy / micronutrient-dense ingredient among the first three, and for the absence of added sugar or salt. You do not compute these — just identify the ingredients and read the panel accurately.
+
+NUTRITION PANEL NOT VISIBLE: if the nutritional information panel is not present in the extracted text, set threshold_flags to an empty array and nutrition_data_complete to false, with moderation_advice noting 'Nutritional values not visible — scan the nutrition panel for a complete assessment.' Do NOT estimate or guess nutritional values from the product type or from similar products. Ingredient-based concerns still apply normally.
+
+NUTRITIONAL CONCERN OUTPUT — KEEP IT SHORT (the same contract as ingredients):
+For a concern you recognise from nutritional_concerns: set source to 'reference_database' and return ONLY { ingredient, concern_type, concern_level, score_penalty, source }. Leave why_flagged, health_effects, moderation_guidance and better_alternative as "" and who_should_limit as [] — the server fills those from its local database. Do NOT write explanations for these.
+
+UNLISTED NUTRITIONAL CONCERNS: nutritional_concerns is a baseline, not a complete catalogue. If an ingredient is NOT on the list but you know from your training that it has a meaningful nutritional concern, flag it anyway with source 'ai_knowledge' and THEN write why_flagged, health_effects, moderation_guidance and better_alternative yourself, matching the depth and factual tone of a reference entry.
+Assign concern_level and score_penalty yourself on this scale: 'mild' -> penalty 3-5 (minor, fine in normal amounts); 'moderate' -> penalty 6-10 (worth limiting, better alternatives exist); 'significant' -> penalty 11-15 (regular consumption is a real problem). Anchor against the listed items so scoring stays consistent — treat anything comparable to semolina as ~10 and anything comparable to a refined starch as ~8. Never exceed 15; higher penalties are reserved for trans fat and harmful additives, and the server sets its own (higher) numbers for the curated reference-list entries. Add each one to nutritional_concerns_not_in_database.
+Examples this should catch: sago/tapioca pearls, refined coconut oil, condensed milk, rice flour in large proportion, glucose syrup solids, hydrolysed vegetable protein, tapioca maltodextrin.
+Be conservative. Only flag ingredients with a genuine documented concern. Do NOT flag whole foods, spices, herbs, vitamins, minerals, or neutral ingredients like water, natural flavour from real food, or small amounts of salt.
+
+NUTRITION TONE: factual, not alarmist. A refined-grain product is not dangerous — it is simply a less nutritious choice. Say that plainly and suggest what is better. NEVER imply a legal food is unsafe. Nutritional concerns must NEVER change safety_score; that score is for banned substances and harmful additives only.
+
 USER PERSONAL HEALTH PROFILE:
 If — and only if — a "USER PERSONAL HEALTH PROFILE" section is present in the user message, flag ANY ingredient that conflicts with it, even if the ingredient is otherwise safe. Populate each ingredient's 'personal_flags' array with { reason, severity: 'critical' | 'warning' | 'info' } ([] when no conflict, [] for EVERY ingredient when no profile is present). Also return a top-level 'personal_alerts' array of { ingredient: string|null, reason, severity } for whole-product conflicts (e.g. overall high sodium vs hypertension); use ingredient: null for those and do not duplicate an ingredient-level flag. Severity: critical = allergen present or medically dangerous; warning = conflicts with a preference or concerning for a condition; info = mild relevance.
 
@@ -128,9 +189,9 @@ Return ONLY a single valid JSON object (no markdown, no code fences, no text out
    { name, safety_status: 'safe'|'caution'|'harmful'|'banned'|'unknown', reason (one line), health_effects, who_should_avoid, banned_in_countries (string[]), healthier_alternative, source: 'reference_database'|'ai_knowledge', personal_flags: array of { reason, severity } }.
    Per "KEEP IT SHORT" above, the four long fields stay empty for 'reference_database' ingredients.
 
-4. overall_assessment: { safety_score: 0-100 or null, compliance_score: 0-100 or null, safety_status: "ok"|"insufficient_data", compliance_status: "ok"|"insufficient_data", summary: string (MAX 3 sentences — this is shown only inside a collapsed "Full assessment" section, so it does not need to lead), recommendation: string }. Per the ANTI-HALLUCINATION rules, a score is null exactly when its status is "insufficient_data".
+4. overall_assessment: { safety_score: 0-100 or null, compliance_score: 0-100 or null, safety_status: "ok"|"insufficient_data", compliance_status: "ok"|"insufficient_data", summary: string (MAX 3 sentences — this is shown only inside a collapsed "Full assessment" section, so it does not need to lead), recommendation: string }. Per the ANTI-HALLUCINATION rules, a score is null exactly when its status is "insufficient_data". safety_score covers banned substances and harmful additives ONLY — nutritional quality is scored separately by the server and must not bleed into it.
 
-4a. verdict: one of 'safe' | 'caution' | 'avoid' — the single top-line call the user sees first. 'safe' roughly maps to safety_score >= 75 with no harmful/banned ingredients; 'avoid' to any banned ingredient, a serious personal_alert, or safety_score < 50; 'caution' otherwise. If safety_status is "insufficient_data", still give your best-judgement verdict from what you could read.
+4a. verdict: one of 'safe' | 'caution' | 'limit' | 'avoid' — the single top-line call the user sees first. 'safe' roughly maps to safety_score >= 75 AND a good nutrition score with no harmful/banned ingredients; 'avoid' to any banned ingredient, a serious personal_alert, safety_score < 50, or a product that is nutritionally very poor; 'limit' to a product with nothing harmful in it that is nonetheless nutritionally poor (refined grain, high sugar, ultra-processed); 'caution' otherwise. The server recomputes this from the three scores, so give your best judgement and do not agonise. If safety_status is "insufficient_data", still give your best-judgement verdict from what you could read.
 
 4b. verdict_reason: ONE plain sentence backing the verdict, MAXIMUM 20 words. No lists, no semicolons.
 
@@ -145,6 +206,10 @@ Return ONLY a single valid JSON object (no markdown, no code fences, no text out
 8. personal_alerts: array of { ingredient: string|null, reason, severity: 'critical'|'warning'|'info' } — product-level profile conflicts; [] when there is no profile or no conflict.
 
 9. detected_category: { category: the ACTIVE CATEGORY value, confidence: 'high'|'medium'|'low', signals_found: string[], regulatory_body: string, applicable_act: string, complaint_portal: string } — take regulatory_body / applicable_act / complaint_portal from the ACTIVE CATEGORY block.
+
+10. nutritional_analysis — FOOD CATEGORIES ONLY; omit this key entirely for personal_care, household_cleaning and baby_product_care:
+{ nutrition_score: number, nutrition_data_complete: boolean, food_type: 'staple_ingredient'|'minimally_processed'|'processed_product', food_type_reason: string, nutrient_density: 'high'|'moderate'|'low'|'empty', density_note: string, primary_concern: null, concerns: [{ ingredient, concern_type: 'refined_grain'|'added_sugar'|'refined_oil'|'high_sodium'|'saturated_fat'|'trans_fat'|'processed_protein'|'low_nutrient_density', concern_level: 'mild'|'moderate'|'significant', why_flagged, health_effects, moderation_guidance, better_alternative, who_should_limit: string[], score_penalty: number, source: 'reference_database'|'ai_knowledge' }], threshold_flags: [{ nutrient, value_per_100: number, unit: 'g'|'mg', level: 'low'|'medium'|'medium_high'|'high'|'very_high', penalty: number }], positive_notes: string[], sugar_alias_count: number, sugar_aliases_found: string[], is_ultra_processed: boolean, ingredient_order_note: string|null, moderation_advice: string, nutritional_concerns_not_in_database: string[] }
+Give nutrition_score, level and penalty your best estimate and set primary_concern to null — the SERVER recomputes nutrition_score, every band and penalty, the score ceilings, the food_type scale, the nutrient_density downgrades, the positive-nutrition bonuses and primary_concern from your identifications, so accuracy of identification (an honest food_type and nutrient_density) matters far more than accuracy of arithmetic. Read the Protein row off the panel too when it is present.
 
 If the text is too garbled or sparse to identify a product, still return the full JSON structure with best-effort nulls, empty arrays, zeroed additive_count, cumulative_risk 'low', empty personal_flags/personal_alerts, safety_score null + safety_status "insufficient_data", compliance_score null + compliance_status "insufficient_data", verdict 'caution', verdict_reason "Not enough of the label was readable to judge this product.", key_findings ["Only part of the label could be read"], detected_category with the ACTIVE CATEGORY value and confidence 'low', and a summary explaining the text could not be reliably read.`;
 
@@ -267,7 +332,12 @@ async function routeCategory(text: string): Promise<{
         : [],
       detected: typeof parsed?.detected === "string" ? parsed.detected.trim() : "",
     };
-  } catch {
+  } catch (err) {
+    // A hard outage (out of credits, broken key) will hit the Sonnet call too —
+    // surface it now rather than burning the expensive step to rediscover it.
+    // Everything else (a parse slip, a transient blip) degrades to 'unknown',
+    // which STEP B treats as a food scan.
+    if (isHardAnthropicOutage(err)) throw err;
     return { category: "unknown", confidence: "low", signals: [], detected: "" };
   }
 }
@@ -306,6 +376,11 @@ export async function POST(request: Request) {
     );
   }
 
+  // Fail early: if a recent call from this instance hit the credit wall, don't
+  // put the user through routing + analysis just to return the same thing.
+  const preflight = anthropicPreflight("analyze");
+  if (preflight) return preflight;
+
   const healthProfileBlock = formatHealthProfile(body?.userHealthProfile);
 
   const categoryOverride =
@@ -317,14 +392,22 @@ export async function POST(request: Request) {
   // ---- STEP A: route the product to a category (Haiku), or trust the user ----
   // A category override means the user has explicitly asserted this IS a
   // package, so the "not a package" gate is skipped for that path.
-  const routed = categoryOverride
-    ? {
-        category: categoryOverride as string,
-        confidence: "high" as const,
-        signals: ["user confirmed the category"],
-        detected: "",
-      }
-    : await routeCategory(extractedText);
+  let routed: Awaited<ReturnType<typeof routeCategory>>;
+  try {
+    routed = categoryOverride
+      ? {
+          category: categoryOverride as string,
+          confidence: "high" as const,
+          signals: ["user confirmed the category"],
+          detected: "",
+        }
+      : await routeCategory(extractedText);
+  } catch (err) {
+    return (
+      handleAnthropicError(err, "analyze:router") ??
+      jsonError("The analysis service failed to respond.", 502)
+    );
+  }
 
   // ---- HARD GATE: not a packaged product -> STOP. Never call Sonnet, never
   // produce a score. (FIX 1 + FIX 2) ----
@@ -417,19 +500,13 @@ export async function POST(request: Request) {
       .join("")
       .trim();
   } catch (err) {
-    if (err instanceof Anthropic.AuthenticationError) {
-      // Don't leak key/config detail to the client.
-      return jsonError("Analysis service is not configured correctly.", 500);
-    }
-    if (err instanceof Anthropic.RateLimitError) {
-      return jsonError("Analysis service is busy. Try again in a moment.", 429);
-    }
-    if (err instanceof Anthropic.APIError) {
-      return jsonError("The analysis service failed to respond.", 502, {
-        detail: err.message,
-      });
-    }
-    return jsonError("Unexpected error while contacting the analysis service.", 500);
+    // Recognised Anthropic outages (out of credits, rate limit, overload, bad
+    // key, connectivity) become a specific, non-leaky error code + retryable
+    // flag; anything else stays a generic 502.
+    return (
+      handleAnthropicError(err, "analyze:sonnet") ??
+      jsonError("The analysis service failed to respond.", 502)
+    );
   }
 
   if (!responseText) {
@@ -465,8 +542,26 @@ export async function POST(request: Request) {
     }
 
     // Normalised, then enriched with the local long-form explanations the model
-    // was told NOT to regenerate (FIX 3). The client renders this unguarded.
-    analysis = enrichAnalysis(normalizeAnalysis(parsed));
+    // was told NOT to regenerate (FIX 3). enrichAnalysis also rebuilds and
+    // RE-SCORES nutritional_analysis, and recomputes nutrition_score,
+    // overall_score and the verdict locally. The client renders this unguarded.
+    analysis = enrichAnalysis(normalizeAnalysis(parsed), {
+      category: activeCategory,
+    });
+
+    // Deterministic nutrition-vs-health-profile escalation. Done here rather
+    // than in the prompt so "diabetic + refined grain" fires every time.
+    const nutritionAlerts = nutritionPersonalAlerts(
+      body?.userHealthProfile ?? null,
+      analysis,
+    );
+    if (nutritionAlerts.length) {
+      analysis.personal_alerts = [
+        ...nutritionAlerts.filter((f) => f.severity === "critical"),
+        ...(analysis.personal_alerts ?? []),
+        ...nutritionAlerts.filter((f) => f.severity !== "critical"),
+      ];
+    }
 
     // Additive dosage / FSSAI limit checking is a food-only concept. The prompt
     // asks for it to be zeroed outside the food categories, but the model

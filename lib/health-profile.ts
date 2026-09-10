@@ -52,6 +52,9 @@ export const CONDITION_OPTIONS = [
   "Hypertension (high BP)",
   "Heart condition",
   "Kidney condition",
+  // Drives the nutrition escalations in nutritionPersonalAlerts() — an
+  // ultra-processed or high-sugar product is flagged against this.
+  "Weight management",
   "Pregnant",
   "Breastfeeding",
   "Child under 5",

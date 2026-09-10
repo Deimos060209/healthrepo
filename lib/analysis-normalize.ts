@@ -26,6 +26,13 @@ import type {
   DetectedCategory,
   DetectedCategoryId,
   ComplianceItemStatus,
+  NutritionalAnalysis,
+  NutritionalConcern,
+  NutritionalConcernLevel,
+  NutritionalConcernType,
+  NutrientLevel,
+  ThresholdFlag,
+  Verdict,
 } from "@/types/analysis";
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -265,6 +272,130 @@ export function normalizeDosageAnalysis(raw: unknown): DosageAnalysis {
   };
 }
 
+const CONCERN_TYPES: readonly string[] = [
+  "refined_grain",
+  "added_sugar",
+  "refined_oil",
+  "high_sodium",
+  "saturated_fat",
+  "trans_fat",
+  "processed_protein",
+  "low_nutrient_density",
+];
+const CONCERN_LEVELS: readonly string[] = ["mild", "moderate", "significant"];
+const NUTRIENT_LEVELS: readonly string[] = [
+  "low",
+  "medium",
+  "medium_high",
+  "high",
+  "very_high",
+];
+
+/** Plain number, or null. Used for nutrient readings off the panel. */
+const numOrNull = (v: unknown): number | null => {
+  if (typeof v === "number") return Number.isFinite(v) ? v : null;
+  const s = str(v);
+  if (!s) return null;
+  const m = s.replace(/,/g, "").match(/-?\d+(\.\d+)?/);
+  return m ? Number(m[0]) : null;
+};
+
+/**
+ * Coerce the model's `nutritional_analysis` into the right SHAPE. It does not
+ * score anything — lib/enrich-analysis.ts recomputes every penalty, level and
+ * total from local reference data. Returns null when the model omitted the
+ * field (which it is told to do for every non-food category).
+ */
+export function normalizeNutritionalAnalysis(
+  raw: unknown,
+): NutritionalAnalysis | null {
+  if (!isObj(raw)) return null;
+
+  const concerns: NutritionalConcern[] = (
+    Array.isArray(raw.concerns) ? raw.concerns : []
+  )
+    .filter(isObj)
+    .map((c) => {
+      const level = String(c.concern_level ?? "").toLowerCase().trim();
+      const type = String(c.concern_type ?? "")
+        .toLowerCase()
+        .trim()
+        .replace(/[\s-]+/g, "_");
+      return {
+        ingredient: str(c.ingredient ?? c.name) ?? "",
+        concern_type: (CONCERN_TYPES.includes(type)
+          ? type
+          : "low_nutrient_density") as NutritionalConcernType,
+        concern_level: (CONCERN_LEVELS.includes(level)
+          ? level
+          : "moderate") as NutritionalConcernLevel,
+        why_flagged: str(c.why_flagged),
+        health_effects: str(c.health_effects),
+        moderation_guidance: str(c.moderation_guidance),
+        who_should_limit: strList(c.who_should_limit),
+        better_alternative: str(c.better_alternative),
+        score_penalty: numOrNull(c.score_penalty) ?? 0,
+        source:
+          c.source === "reference_database" ? "reference_database" : "ai_knowledge",
+      } satisfies NutritionalConcern;
+    })
+    .filter((c) => c.ingredient.length > 0);
+
+  const threshold_flags: ThresholdFlag[] = (
+    Array.isArray(raw.threshold_flags) ? raw.threshold_flags : []
+  )
+    .filter(isObj)
+    .map((f) => {
+      const lvl = String(f.level ?? "").toLowerCase().trim();
+      return {
+        nutrient: str(f.nutrient) ?? "",
+        value_per_100: numOrNull(f.value_per_100) ?? 0,
+        unit: str(f.unit) ?? "g",
+        level: (NUTRIENT_LEVELS.includes(lvl) ? lvl : "medium") as NutrientLevel,
+        penalty: numOrNull(f.penalty) ?? 0,
+        reference: str(f.reference),
+      } satisfies ThresholdFlag;
+    })
+    .filter((f) => f.nutrient.length > 0);
+
+  const density = String(raw.nutrient_density ?? "").toLowerCase().trim();
+  const foodType = String(raw.food_type ?? "")
+    .toLowerCase()
+    .trim()
+    .replace(/[\s-]+/g, "_");
+
+  return {
+    nutrition_score: scoreOrNull(raw.nutrition_score),
+    nutrition_data_complete: raw.nutrition_data_complete === true,
+    // Shape only — enrichAnalysis() recomputes food_type, density and the
+    // primary concern locally (with the model's values as a starting point).
+    food_type: ([
+      "staple_ingredient",
+      "minimally_processed",
+      "processed_product",
+    ].includes(foodType)
+      ? foodType
+      : "processed_product") as NutritionalAnalysis["food_type"],
+    food_type_reason: str(raw.food_type_reason),
+    nutrient_density: (["high", "moderate", "low", "empty"].includes(density)
+      ? density
+      : "moderate") as NutritionalAnalysis["nutrient_density"],
+    density_note: str(raw.density_note),
+    primary_concern: null,
+    concerns,
+    threshold_flags,
+    positive_notes: sentenceList(raw.positive_notes),
+    sugar_alias_count: count(raw.sugar_alias_count),
+    sugar_aliases_found: strList(raw.sugar_aliases_found),
+    is_ultra_processed: raw.is_ultra_processed === true,
+    ingredient_order_note: str(raw.ingredient_order_note),
+    moderation_advice: str(raw.moderation_advice) ?? "",
+    nutritional_concerns_not_in_database: strList(
+      raw.nutritional_concerns_not_in_database,
+    ),
+  };
+}
+
 export function normalizeAnalysis(raw: unknown): ProductAnalysis {
   const r = isObj(raw) ? raw : {};
 
@@ -399,6 +530,9 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
     legal_metrology_compliance,
     ingredient_analysis,
     dosage_analysis: normalizeDosageAnalysis(r.dosage_analysis),
+    // Shape only — enrichAnalysis() rebuilds and rescores this, and drops it
+    // entirely for the non-food categories.
+    nutritional_analysis: normalizeNutritionalAnalysis(r.nutritional_analysis),
     personal_alerts: personalFlags(r.personal_alerts),
     overall_assessment,
     banned_ingredients_check,
@@ -406,18 +540,23 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
   };
 }
 
-const VERDICTS: readonly string[] = ["safe", "caution", "avoid"];
-/** Coerce the model's verdict, deriving a sane one when it is missing/garbled. */
+const VERDICTS: readonly string[] = ["safe", "caution", "limit", "avoid"];
+/**
+ * Coerce the model's verdict, deriving a sane one when it is missing/garbled.
+ * This is the FALLBACK: for a fully-scored scan, lib/enrich-analysis.ts
+ * recomputes the verdict from the three dimensions and overrides it.
+ */
 export function normalizeVerdict(
   raw: unknown,
   safetyScore: number | null,
   bannedCount: number,
   harmfulCount: number,
-): "safe" | "caution" | "avoid" {
+): Verdict {
   const s = String(raw ?? "").toLowerCase().trim();
-  if (VERDICTS.includes(s)) return s as "safe" | "caution" | "avoid";
+  if (VERDICTS.includes(s)) return s as Verdict;
   if (s.includes("avoid") || s.includes("unsafe") || s.includes("danger"))
     return "avoid";
+  if (s.includes("limit") || s.includes("occasional")) return "limit";
   if (s.includes("caution") || s.includes("moderate")) return "caution";
   if (s === "safe" || s.includes("ok") || s.includes("good")) return "safe";
   // Derive from the numbers when the model gave nothing usable.

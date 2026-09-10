@@ -343,12 +343,19 @@ const fontRules = (LEGAL_METROLOGY_RULES as Record<string, unknown>).FONT_SIZE_R
   | undefined;
 if (!fontRules) bad("FONT_SIZE_RULES (Rule 7) missing");
 else {
-  const table = (fontRules.height_table ?? fontRules.size_table ?? fontRules.table) as unknown[] | undefined;
+  // The real key is `numeral_height_table`; the three names guessed here never
+  // existed, so this check reported a missing table rather than checking one.
+  const table = (fontRules.numeral_height_table ??
+    fontRules.height_table ??
+    fontRules.size_table ??
+    fontRules.table) as unknown[] | undefined;
   console.log(`    FONT_SIZE_RULES rows: ${Array.isArray(table) ? table.length : "n/a"} — keys: ${Object.keys(fontRules).join(", ")}`);
   if (Array.isArray(table) && table.length === 4) ok("Rule 7 font-size table has 4 rows");
   else bad(`Rule 7 font-size table not 4 rows (got ${Array.isArray(table) ? table.length : "missing"})`);
 }
-if (!(LEGAL_METROLOGY_RULES as Record<string, unknown>).PRINCIPAL_DISPLAY_PANEL) bad("PRINCIPAL_DISPLAY_PANEL rules missing");
+// The key is PRINCIPAL_DISPLAY_PANEL_RULES — the shorter name never existed.
+if (!(LEGAL_METROLOGY_RULES as Record<string, unknown>).PRINCIPAL_DISPLAY_PANEL_RULES)
+  bad("PRINCIPAL_DISPLAY_PANEL_RULES missing");
 else ok("PRINCIPAL_DISPLAY_PANEL rules present");
 
 // HEALTHIER_ALTERNATIVES coverage: every harmful/banned name must have an entry

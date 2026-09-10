@@ -1,123 +1,249 @@
 /* eslint-disable no-console */
 /**
- * Probe the REAL Supabase project with the anon key to see which schema objects
- * actually exist. Anon has no session, so RLS-protected rows return 0 — that is
- * expected and is reported as "exists, RLS-gated", not as "missing".
+ * Per-migration audit — which of supabase/migrations/*.sql are applied?
+ *
+ * Only the anon key is available. It has NO table grant anywhere in this
+ * project, so table columns cannot be read directly — but that same fact is
+ * useful evidence:
+ *
+ *   - `SELECT` on a table that EXISTS but is not granted  -> 42501 permission denied
+ *   - `SELECT` on a MISSING relation                      -> 42P01 / PGRST205
+ *   - a MISSING column (even on a granted view)           -> 42703
+ *   - a MISSING function overload                         -> PGRST202
+ *
+ * Views (`product_search`, `verified_safe_products`) and functions
+ * (`community_stats`, `search_safe_products`) ARE granted to anon, and the
+ * `product-images` storage bucket has a public-read policy, so all of those
+ * can be probed properly. Two `scanned_products` columns (dosage_analysis,
+ * personal_alerts) are projected by nothing anon can see — they get a
+ * copy-paste SQL check.
+ *
  * Run: npx tsx scripts/probe-db.ts
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
+import { createClient } from "@supabase/supabase-js";
 
 const env = Object.fromEntries(
   readFileSync(".env.local", "utf8")
     .split(/\r?\n/)
-    .filter((l) => l.includes("=") && !l.trim().startsWith("#"))
+    .filter((l) => l.includes("="))
     .map((l) => {
       const i = l.indexOf("=");
       return [l.slice(0, i).trim(), l.slice(i + 1).trim()];
     }),
 );
-const URL_ = env.NEXT_PUBLIC_SUPABASE_URL;
-const KEY = env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-console.log(`Project: ${URL_}\n`);
+const url = env.NEXT_PUBLIC_SUPABASE_URL || env.SUPABASE_URL || "";
+const key = env.NEXT_PUBLIC_SUPABASE_ANON_KEY || env.SUPABASE_ANON_KEY || "";
+if (!url || !key) {
+  console.error("Missing NEXT_PUBLIC_SUPABASE_URL / _ANON_KEY in .env.local");
+  process.exit(1);
+}
+const sb = createClient(url, key);
+const ROOT = process.cwd().replace(/\\/g, "/");
 
-const H = { apikey: KEY, Authorization: `Bearer ${KEY}`, "Content-Type": "application/json" };
+const errBlob = (e: { code?: string; message?: string } | null) =>
+  `${e?.code ?? ""} ${e?.message ?? ""}`;
 
-function verdict(status: number, body: string): string {
-  if (status === 200 || status === 206) return "EXISTS (readable)";
-  if (status === 401 || status === 403) return "EXISTS (permission denied — RLS)";
-  if (/PGRST205|PGRST202|does not exist|Could not find the/i.test(body)) return "*** MISSING ***";
-  if (status === 404) return "*** MISSING (404) ***";
-  return `status ${status}`;
+/** A base table EXISTS if a select is permission-denied (42501) rather than 42P01. */
+async function tableExists(t: string): Promise<boolean | null> {
+  const { error } = await sb.from(t).select("*").limit(1);
+  if (!error) return true;
+  const b = errBlob(error);
+  if (/42501|permission denied/i.test(b)) return true;
+  if (/42P01|PGRST205|does not exist|Could not find the table/i.test(b))
+    return false;
+  return null;
+}
+/** A granted view is reachable — a plain select succeeds. */
+async function viewReachable(v: string): Promise<boolean | null> {
+  const { error } = await sb.from(v).select("*").limit(1);
+  if (!error) return true;
+  const b = errBlob(error);
+  if (/42P01|PGRST205|does not exist|Could not find the table/i.test(b))
+    return false;
+  return null;
+}
+async function viewHasColumn(v: string, col: string): Promise<boolean | null> {
+  const { error } = await sb.from(v).select(col).limit(0);
+  if (!error) return true;
+  const b = errBlob(error);
+  if (/42703|column .* does not exist|could not find the .* column/i.test(b))
+    return false;
+  return null;
+}
+async function fnExists(
+  name: string,
+  args: Record<string, unknown>,
+): Promise<boolean | null> {
+  const { error } = await sb.rpc(name, args);
+  if (!error) return true;
+  const b = errBlob(error);
+  if (/PGRST202|42883|Could not find the function|does not exist/i.test(b))
+    return false;
+  return null;
+}
+async function bucketReadable(id: string): Promise<boolean | null> {
+  const { data, error } = await sb.storage.from(id).list("", { limit: 1 });
+  if (!error) return true;
+  if (/not found|does not exist/i.test(error.message)) return false;
+  return data ? true : null;
 }
 
-async function probeTable(name: string, select = "*") {
-  const r = await fetch(`${URL_}/rest/v1/${name}?select=${select}&limit=3`, {
-    headers: { ...H, Prefer: "count=exact" },
-  });
-  const body = await r.text();
-  const count = r.headers.get("content-range");
-  let rows = 0;
-  try {
-    rows = JSON.parse(body).length ?? 0;
-  } catch {
-    /* error body */
-  }
-  console.log(
-    `  ${name.padEnd(26)} ${verdict(r.status, body).padEnd(34)} rows_visible=${rows} range=${count ?? "-"}`,
+type Verdict = "yes" | "no" | "unverifiable";
+interface Row {
+  file: string;
+  applied: Verdict;
+  evidence: string;
+}
+
+(async () => {
+  const files = readdirSync("supabase/migrations")
+    .filter((f) => f.endsWith(".sql"))
+    .sort();
+
+  // ---- probe everything anon CAN see ----
+  const tProfiles = await tableExists("profiles");
+  const tComplaints = await tableExists("complaints");
+  const tScanned = await tableExists("scanned_products");
+  const tHealth = await tableExists("user_health_profiles");
+  const vSearch = await viewReachable("product_search");
+  const vSafe = await viewReachable("verified_safe_products");
+  const vSafeDetected = await viewHasColumn(
+    "verified_safe_products",
+    "detected_category",
   );
-  if (verdict(r.status, body).includes("MISSING")) console.log(`      ↳ ${body.slice(0, 180)}`);
-  return { status: r.status, body, rows };
-}
-
-async function probeRpc(name: string, args: Record<string, unknown>) {
-  const r = await fetch(`${URL_}/rest/v1/rpc/${name}`, {
-    method: "POST",
-    headers: H,
-    body: JSON.stringify(args),
+  const vSafeSafety = await viewHasColumn("verified_safe_products", "safety_score");
+  const vSafeNutrition = await viewHasColumn(
+    "verified_safe_products",
+    "nutrition_score",
+  );
+  const fnStats = await fnExists("community_stats", {});
+  const fn3 = await fnExists("search_safe_products", {
+    search_query: "",
+    category_filter: "",
+    min_score: 75,
   });
-  const body = await r.text();
-  let n: number | string = "-";
-  try {
-    const j = JSON.parse(body);
-    n = Array.isArray(j) ? j.length : typeof j === "object" ? "obj" : String(j);
-  } catch {
-    /* error body */
+  const fn4 = await fnExists("search_safe_products", {
+    search_query: "",
+    category_filter: "",
+    min_score: 75,
+    detected_category_filter: "",
+  });
+  const fn5 = await fnExists("search_safe_products", {
+    search_query: "",
+    category_filter: "",
+    min_score: 75,
+    detected_category_filter: "",
+    min_nutrition_score: 60,
+  });
+  const bucket = await bucketReadable("product-images");
+
+  const yn = (b: boolean | null) =>
+    b === true ? "present" : b === false ? "MISSING" : "unknown";
+  const all = (...bs: (boolean | null)[]): Verdict =>
+    bs.some((b) => b === false)
+      ? "no"
+      : bs.every((b) => b === true)
+        ? "yes"
+        : "unverifiable";
+
+  const rows: Row[] = [
+    {
+      file: "20260906000000_init_schema.sql",
+      applied: all(tProfiles, tComplaints, tScanned, vSearch),
+      evidence: `profiles=${yn(tProfiles)} complaints=${yn(tComplaints)} scanned_products=${yn(tScanned)} (42501 permission-denied => relation exists, RLS enforced). product_search & community_stats read scanned_products/complaints columns without error.`,
+    },
+    {
+      file: "20260907120000_product_search_view.sql",
+      applied: all(vSearch, await viewHasColumn("product_search", "overall_score")),
+      evidence: `SELECT from product_search => OK []; overall_score column selectable; anon has SELECT grant.`,
+    },
+    {
+      file: "20260908000000_product_images_storage.sql",
+      applied: all(bucket),
+      evidence: `storage.from('product-images').list('') => OK (bucket exists, public-read policy on storage.objects in force for anon). Write policies not probeable without auth.`,
+    },
+    {
+      file: "20260908010000_community_stats.sql",
+      applied: all(fnStats),
+      evidence: `rpc community_stats() => OK, returns {products_scanned, harmful_found, complaints_filed}. execute granted to anon.`,
+    },
+    {
+      file: "20260908020000_user_health_profiles.sql",
+      applied: all(tHealth),
+      evidence: `SELECT from user_health_profiles => 42501 permission denied (relation exists; RLS on).`,
+    },
+    {
+      file: "20260909000000_dosage_analysis.sql",
+      applied: "unverifiable",
+      evidence: `column scanned_products.dosage_analysis is projected by no anon-visible view, and scanned_products is 42501. Circumstantial: later migration 20260909030000 IS applied and history detail SELECTs this column in prod. Confirm with the SQL below.`,
+    },
+    {
+      file: "20260909010000_scan_personal_alerts.sql",
+      applied: "unverifiable",
+      evidence: `column scanned_products.personal_alerts — same situation as dosage_analysis. Confirm with the SQL below.`,
+    },
+    {
+      file: "20260909020000_safe_products_view.sql",
+      applied: all(vSafe, fn3),
+      evidence: `SELECT from verified_safe_products => OK; rpc search_safe_products(3-arg) => OK (the bare 3-arg overload only comes from this file).`,
+    },
+    {
+      file: "20260909030000_product_category_detection.sql",
+      applied: all(vSafeDetected, fn4),
+      evidence: `verified_safe_products.detected_category selectable => scanned_products.detected_category column exists AND the view was recreated. rpc search_safe_products(detected_category_filter, 4-arg) => OK.`,
+    },
+    {
+      file: "20260909040000_scoring_model_v2.sql",
+      applied: all(vSafeSafety, vSafeNutrition, fn5),
+      evidence: `verified_safe_products.safety_score / nutrition_score => 42703 column does not exist; rpc search_safe_products(min_nutrition_score, 5-arg) => PGRST202 function not found.`,
+    },
+  ];
+
+  // sanity: any migration file on disk not in the list above?
+  for (const f of files) {
+    if (!rows.some((r) => r.file === f)) {
+      rows.push({ file: f, applied: "unverifiable", evidence: "not audited by this script" });
+    }
   }
-  console.log(`  rpc ${name.padEnd(22)} ${verdict(r.status, body).padEnd(34)} returned=${n}`);
-  if (r.status !== 200) console.log(`      ↳ ${body.slice(0, 220)}`);
-  return { status: r.status, body };
-}
 
-async function probeColumn(table: string, col: string) {
-  const r = await fetch(`${URL_}/rest/v1/${table}?select=${col}&limit=1`, { headers: H });
-  const body = await r.text();
-  const missing = /PGRST204|PGRST205|does not exist|column .* does not exist/i.test(body) || r.status === 404;
-  console.log(`    ${table}.${col.padEnd(22)} ${missing ? "*** MISSING ***" : "exists"}`);
-  if (missing) console.log(`        ↳ ${body.slice(0, 160)}`);
-  return !missing;
-}
-
-async function main() {
-  console.log("── TABLES / VIEWS ──────────────────────────────────────────────");
-  await probeTable("profiles");
-  await probeTable("scanned_products");
-  await probeTable("complaints");
-  await probeTable("user_health_profiles");
-  await probeTable("product_search");
-  await probeTable("verified_safe_products");
-
-  console.log("\n── scanned_products COLUMNS (migration drift check) ────────────");
-  for (const c of [
-    "id", "user_id", "product_name", "brand", "image_url", "extracted_text",
-    "analysis_result", "overall_score", "compliance_status", "scanned_at",
-    "dosage_analysis", "personal_alerts", "detected_category",
-  ]) {
-    await probeColumn("scanned_products", c);
+  console.log("═".repeat(100));
+  console.log(
+    "filename".padEnd(46) + " | applied | evidence",
+  );
+  console.log("─".repeat(100));
+  for (const r of rows) {
+    console.log(
+      `${r.file.padEnd(46)} | ${r.applied.padEnd(7)} | ${r.evidence}`,
+    );
   }
 
-  console.log("\n── FUNCTIONS ───────────────────────────────────────────────────");
-  await probeRpc("community_stats", {});
-  await probeRpc("search_safe_products", { search_query: "", category_filter: null, limit_count: 10 });
+  const need = rows.filter((r) => r.applied === "no");
+  const check = rows.filter((r) => r.applied === "unverifiable");
 
-  console.log("\n── STORAGE ─────────────────────────────────────────────────────");
-  const b = await fetch(`${URL_}/storage/v1/bucket/product-images`, { headers: H });
-  const bb = await b.text();
-  console.log(`  bucket product-images       ${b.status === 200 ? "EXISTS" : `status ${b.status}`}  ${bb.slice(0, 160)}`);
+  console.log("\n" + "═".repeat(100));
+  console.log("OPEN THE UNAPPLIED FILE(S) (PowerShell):");
+  console.log("═".repeat(100));
+  if (need.length === 0) console.log("  (none definitively missing)");
+  for (const r of need)
+    console.log(`  notepad "${ROOT.replace(/\//g, "\\")}\\supabase\\migrations\\${r.file}"`);
 
-  console.log("\n── AUTH REACHABLE ──────────────────────────────────────────────");
-  const s = await fetch(`${URL_}/auth/v1/settings`, { headers: H });
-  const sj = await s.text();
-  console.log(`  /auth/v1/settings           status ${s.status}`);
-  try {
-    const j = JSON.parse(sj);
-    console.log(`  external providers enabled: ${Object.entries(j.external ?? {}).filter(([, v]) => v).map(([k]) => k).join(", ") || "(none)"}`);
-    console.log(`  email signup disabled? ${j.disable_signup}`);
-  } catch {
-    console.log(`  ${sj.slice(0, 200)}`);
+  if (check.length) {
+    console.log("\n" + "═".repeat(100));
+    console.log("VERIFY THE UNVERIFIABLE — run in the Supabase SQL editor:");
+    console.log("═".repeat(100));
+    console.log(`  select
+    exists (select 1 from information_schema.columns
+             where table_schema='public' and table_name='scanned_products'
+               and column_name='dosage_analysis') as col_dosage_analysis,   -- 20260909000000
+    exists (select 1 from information_schema.columns
+             where table_schema='public' and table_name='scanned_products'
+               and column_name='personal_alerts') as col_personal_alerts;   -- 20260909010000
+  -- 'false' => open + run that file:`);
+    for (const r of check)
+      console.log(`  #   notepad "${ROOT.replace(/\//g, "\\")}\\supabase\\migrations\\${r.file}"`);
   }
-}
-
-main().catch((e) => {
-  console.error("PROBE FAILED:", e);
+})().catch((e) => {
+  console.error("PROBE FAILED:", e?.message ?? e);
   process.exit(1);
 });

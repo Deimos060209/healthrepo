@@ -21,6 +21,8 @@ import type {
   IngredientAnalysis,
   ComplianceItem,
   SafetyStatus,
+  NutritionalConcernLevel,
+  Verdict,
 } from "@/types/analysis";
 
 // ---------------------------------------------------------------------------
@@ -83,6 +85,7 @@ export async function generateReport(
   drawPersonalAlerts(R, a);
   drawCompliance(R, a);
   drawIngredients(R, a);
+  drawNutrition(R, a);
   drawDosage(R, a);
   drawAlternatives(R, a);
   drawOverall(R, a);
@@ -107,6 +110,7 @@ const TEAL_DARK: RGB = [15, 118, 110];
 const RED: RGB = [220, 38, 38]; // red-600
 const RED_DARK: RGB = [153, 27, 27]; // red-800 (banned)
 const AMBER: RGB = [217, 119, 6]; // amber-600 (readable)
+const ORANGE: RGB = [194, 65, 12]; // orange-700 (nutrition: 'significant')
 const GREEN: RGB = [22, 163, 74]; // green-600
 const INK: RGB = [39, 39, 42];
 const MUTED: RGB = [113, 113, 122];
@@ -114,6 +118,7 @@ const LINE: RGB = [224, 224, 228];
 const ZEBRA: RGB = [250, 250, 251];
 const TINT_GREEN: RGB = [220, 252, 231];
 const TINT_AMBER: RGB = [254, 243, 199];
+const TINT_ORANGE: RGB = [255, 237, 213];
 const TINT_RED: RGB = [254, 226, 226];
 const TINT_ZINC: RGB = [244, 244, 245];
 
@@ -278,6 +283,32 @@ function statusStyle(s: SafetyStatus): { label: string; color: RGB; tint: RGB } 
   }
 }
 
+const CONCERN_TYPE_LABEL: Record<string, string> = {
+  refined_grain: "Refined grain",
+  added_sugar: "Added sugar",
+  refined_oil: "Refined oil",
+  high_sodium: "High sodium",
+  saturated_fat: "Saturated fat",
+  trans_fat: "Trans fat",
+  processed_protein: "Processed meat",
+  low_nutrient_density: "Low nutrient density",
+};
+
+function concernStyle(level: NutritionalConcernLevel): {
+  label: string;
+  color: RGB;
+  tint: RGB;
+} {
+  switch (level) {
+    case "significant":
+      return { label: "Significant", color: ORANGE, tint: TINT_ORANGE };
+    case "moderate":
+      return { label: "Moderate", color: AMBER, tint: TINT_AMBER };
+    default:
+      return { label: "Mild", color: MUTED, tint: TINT_ZINC };
+  }
+}
+
 function scoreBand(score: number): { word: string; rgb: RGB } {
   const s = clamp(score);
   if (s >= 80) return { word: "Safe", rgb: GREEN };
@@ -291,6 +322,14 @@ function recommendationText(score: number): string {
   if (s >= 50) return "CONSUME WITH CAUTION";
   return "AVOID THIS PRODUCT";
 }
+
+/** The big banner line, keyed off the verdict rather than the safety score. */
+const VERDICT_TEXT: Record<Verdict, { text: string; rgb: RGB }> = {
+  safe: { text: "SAFE TO CONSUME", rgb: GREEN },
+  caution: { text: "CONSUME WITH CAUTION", rgb: AMBER },
+  limit: { text: "OKAY OCCASIONALLY - NOT AN EVERYDAY CHOICE", rgb: ORANGE },
+  avoid: { text: "AVOID THIS PRODUCT", rgb: RED },
+};
 
 function complianceVerdict(a: ProductAnalysis): {
   key: "compliant" | "partial" | "non_compliant" | "unknown";
@@ -993,6 +1032,199 @@ function drawIngredients(R: Layout, a: ProductAnalysis) {
   }
 }
 
+/**
+ * STEP 9 — nutritional quality. Skipped entirely for non-food products, where
+ * `nutritional_analysis` is absent by design. Every string goes through the
+ * Layout helpers, so it is sanitised and wrapped like everything else.
+ */
+function drawNutrition(R: Layout, a: ProductAnalysis) {
+  const n = a.nutritional_analysis;
+  if (!n) return; // non-food: the section does not exist
+
+  R.heading("Nutritional Quality");
+
+  R.paragraph(
+    "This is a separate dimension from safety. Every ingredient below is legal and additive-free — the concern is dietary quality, not danger.",
+    { size: 8.5, color: MUTED, gapAfter: 6 },
+  );
+
+  // A null safety score means the ingredients could not be read, so nutrition
+  // cannot be scored either — belt and braces alongside the same rule in
+  // lib/enrich-analysis.ts, since stored rows also reach this generator.
+  const ingredientsUnreadable =
+    a.overall_assessment?.safety_score == null ||
+    a.overall_assessment?.safety_status === "insufficient_data";
+  if (n.nutrition_score == null || ingredientsUnreadable)
+    R.insufficientScore("Nutrition score");
+  else R.scoreBar("Nutrition score", n.nutrition_score);
+
+  if (!ingredientsUnreadable) {
+    const FOOD_TYPE_LABEL: Record<string, string> = {
+      staple_ingredient: "Staple ingredient — scored on the gentler cooking-input scale",
+      minimally_processed: "Minimally processed whole food",
+      processed_product: "Processed product — strict scoring applies",
+    };
+    R.paragraph(FOOD_TYPE_LABEL[n.food_type] ?? "Processed product", {
+      bold: true,
+      color: n.food_type === "processed_product" ? MUTED : GREEN,
+      gapAfter: 2,
+    });
+
+    const DENSITY_LABEL: Record<string, string> = {
+      high: "High nutrient density",
+      moderate: "Moderate nutrient density",
+      low: "Low nutrient density",
+      empty: "Empty — negligible nutrition",
+    };
+    R.paragraph(
+      DENSITY_LABEL[n.nutrient_density] ?? "Nutrient density: not assessed",
+      {
+        bold: true,
+        color: n.nutrient_density === "high" ? GREEN : ORANGE,
+        gapAfter: 2,
+      },
+    );
+    if (n.density_note && n.food_type !== "staple_ingredient") {
+      R.paragraph(n.density_note, { size: 9, color: MUTED, gapAfter: 6 });
+    }
+  }
+
+  if (n.primary_concern && !ingredientsUnreadable) {
+    R.paragraph(`Primary concern: ${n.primary_concern.explanation}`, {
+      bold: true,
+      color: ORANGE,
+      gapAfter: 6,
+    });
+  }
+
+  if (!n.nutrition_data_complete) {
+    R.paragraph(
+      "Nutrition panel not visible — the values per 100 g/ml could not be read, so this assessment is based on the ingredients list alone. Scan the back of the pack for a complete assessment.",
+      { size: 9, color: AMBER, gapAfter: 6 },
+    );
+  }
+
+  if (n.is_ultra_processed) {
+    R.paragraph("Ultra-processed food", { bold: true, color: AMBER, gapAfter: 2 });
+    R.paragraph(
+      "Diets high in ultra-processed foods are associated with obesity, cardiovascular disease and type 2 diabetes regardless of individual ingredient safety.",
+      { size: 9, gapAfter: 6 },
+    );
+  }
+
+  if (n.sugar_alias_count >= 3) {
+    R.paragraph(
+      `Sugar is listed under ${n.sugar_alias_count} different names`,
+      { bold: true, color: AMBER, gapAfter: 2 },
+    );
+    R.paragraph(
+      "This product lists sugar under multiple names, which makes the total sugar content appear lower in the ingredients order than it actually is.",
+      { size: 9, gapAfter: 2 },
+    );
+    R.paragraph(`Names found: ${n.sugar_aliases_found.join(", ")}`, {
+      size: 9,
+      color: MUTED,
+      gapAfter: 6,
+    });
+  }
+
+  if (n.ingredient_order_note) {
+    R.paragraph(n.ingredient_order_note, { size: 9, gapAfter: 6 });
+  }
+
+  // ---- Nutrition panel readings ----
+  if (n.threshold_flags.length) {
+    R.paragraph("Nutrition panel", { bold: true, gapAfter: 2 });
+    R.table(
+      [
+        { header: "Nutrient", w: 22 },
+        { header: "Per 100 g / ml", w: 20, align: "center" },
+        { header: "Level", w: 16, align: "center" },
+        { header: "Reference band", w: 42 },
+      ],
+      n.threshold_flags.map((f) => {
+        const bonus = f.penalty < 0;
+        const s = bonus
+          ? { label: "GOOD", color: GREEN, tint: TINT_GREEN }
+          : f.level === "very_high"
+            ? { label: "VERY HIGH", color: RED, tint: TINT_RED }
+            : f.level === "high"
+              ? { label: "HIGH", color: RED, tint: TINT_RED }
+              : f.level === "medium_high"
+                ? { label: "MEDIUM-HIGH", color: AMBER, tint: TINT_AMBER }
+                : f.level === "medium"
+                  ? { label: "MEDIUM", color: AMBER, tint: TINT_AMBER }
+                  : { label: "LOW", color: GREEN, tint: TINT_GREEN };
+        return [
+          { text: f.nutrient, bold: true },
+          { text: `${f.value_per_100} ${f.unit}` },
+          { text: s.label, textColor: s.color, fillColor: s.tint, bold: true },
+          { text: fmt(f.reference) },
+        ] as Cell[];
+      }),
+    );
+  }
+
+  // ---- Each flagged concern, in full ----
+  if (n.concerns.length === 0) {
+    R.paragraph("No nutritional concerns were found in the ingredients list.", {
+      color: MUTED,
+      gapAfter: 6,
+    });
+  } else {
+    R.paragraph(`Flagged ingredients (${n.concerns.length})`, {
+      bold: true,
+      gapAfter: 4,
+    });
+    for (const c of n.concerns) {
+      const style = concernStyle(c.concern_level);
+      R.ensure(46);
+      // Name + level chip on one line.
+      R.doc.setFont("helvetica", "bold");
+      R.doc.setFontSize(10);
+      ink(R.doc, INK);
+      const nameLines = clampLines(
+        R.doc.splitTextToSize(c.ingredient, R.contentW - 120) as string[],
+        2,
+      );
+      nameLines.forEach((ln, i) => {
+        R.doc.text(ln, R.margin, R.y + 9 + i * 12);
+      });
+      R.chip(
+        `${style.label} · ${CONCERN_TYPE_LABEL[c.concern_type] ?? c.concern_type}`.toUpperCase(),
+        R.margin + R.contentW - 118,
+        R.y + 1,
+        style.color,
+        style.tint,
+      );
+      R.y += nameLines.length * 12 + 4;
+
+      if (c.why_flagged) R.paragraph(c.why_flagged, { size: 9, gapAfter: 3 });
+      if (c.health_effects) R.labelledParagraph("What it does", c.health_effects);
+      if (c.moderation_guidance)
+        R.labelledParagraph("How much is fine", c.moderation_guidance);
+      if (c.who_should_limit.length)
+        R.labelledParagraph(
+          "Who should limit it",
+          c.who_should_limit.join(", "),
+        );
+      if (c.better_alternative)
+        R.labelledParagraph("Better alternative", c.better_alternative, GREEN);
+      R.gap(4);
+    }
+  }
+
+  if (n.positive_notes.length) {
+    R.paragraph("Positives", { bold: true, color: GREEN, gapAfter: 2 });
+    R.bullets(n.positive_notes, INK);
+  }
+
+  if (n.moderation_advice) {
+    R.paragraph("In practice", { bold: true, gapAfter: 2 });
+    R.paragraph(n.moderation_advice, { size: 9, gapAfter: 6 });
+  }
+}
+
 function drawDosage(R: Layout, a: ProductAnalysis) {
   const d = a.dosage_analysis;
   R.heading("Additive Dosage Analysis");
@@ -1139,8 +1371,25 @@ function drawOverall(R: Layout, a: ProductAnalysis) {
   if (safetyInsufficient) R.insufficientScore("Safety score");
   else R.scoreBar("Safety score", oa.safety_score as number);
 
+  // Nutrition is a food-only dimension — absent, not zero, for everything else.
+  if (a.nutritional_analysis) {
+    if (a.nutritional_analysis.nutrition_score == null || safetyInsufficient)
+      R.insufficientScore("Nutrition score");
+    else R.scoreBar("Nutrition score", a.nutritional_analysis.nutrition_score);
+  }
+
   if (complianceInsufficient) R.insufficientScore("Compliance score");
   else R.scoreBar("Compliance score", oa.compliance_score as number);
+
+  if (oa?.overall_score != null) {
+    R.scoreBar("OVERALL", oa.overall_score);
+    R.paragraph(
+      a.nutritional_analysis
+        ? "Overall = safety 35% + nutrition 50% + compliance 15%."
+        : "Overall = safety 75% + compliance 25%.",
+      { size: 8, color: MUTED, gapAfter: 2 },
+    );
+  }
   R.gap(4);
 
   if (oa?.summary) {
@@ -1151,8 +1400,57 @@ function drawOverall(R: Layout, a: ProductAnalysis) {
   if (safetyInsufficient) {
     R.bigVerdict("SAFETY VERDICT UNAVAILABLE — PARTIAL SCAN", MUTED);
   } else {
-    const band = scoreBand(oa.safety_score as number);
-    R.bigVerdict(recommendationText(oa.safety_score as number), band.rgb);
+    // The verdict follows the weakest dimension, so it cannot be derived from
+    // the safety score alone — a 96/100-safe maida biscuit is 'limit'.
+    const v = VERDICT_TEXT[a.verdict];
+    const nn = a.nutritional_analysis;
+    const nScore = a.overall_assessment?.nutrition_score;
+    const stapleSparing =
+      nn?.food_type === "staple_ingredient" &&
+      (nn.nutrient_density === "empty" ||
+        /\b(oil|ghee|sugar|jaggery|gur|salt|namak|honey|syrup)\b/i.test(
+          a.product_info?.name ?? "",
+        ));
+
+    if (nn?.food_type === "staple_ingredient" && nScore != null) {
+      // A cooking ingredient, never a "bad product".
+      if (stapleSparing) R.bigVerdict("USE SPARINGLY — A COOKING STAPLE", ORANGE);
+      else if (nScore >= 75) R.bigVerdict("GOOD STAPLE", GREEN);
+      else R.bigVerdict("FINE STAPLE", GREEN);
+    } else if (a.verdict === "safe" && nScore != null) {
+      // 'safe' spans nutrition 66-95: 66-75 is "REASONABLE CHOICE", 76+ "GOOD".
+      R.bigVerdict(nScore <= 75 ? "REASONABLE CHOICE" : "GOOD CHOICE", GREEN);
+    } else if (v) {
+      R.bigVerdict(v.text, v.rgb);
+    } else {
+      const band = scoreBand(oa.safety_score as number);
+      R.bigVerdict(recommendationText(oa.safety_score as number), band.rgb);
+    }
+
+    if (nn?.food_type === "staple_ingredient" && nScore != null) {
+      R.paragraph(
+        stapleSparing
+          ? "A cooking staple that is calorie-dense with little else — use it as an ingredient, in small amounts."
+          : nScore >= 75
+            ? "A sound everyday cooking ingredient."
+            : `A normal, affordable staple — nothing to avoid.${
+                nn.concerns[0]?.better_alternative
+                  ? ` ${nn.concerns[0].better_alternative} is more nutritious.`
+                  : ""
+              }`,
+        { size: 9, color: MUTED, gapAfter: 4 },
+      );
+    } else if (a.verdict === "limit") {
+      R.paragraph(
+        "No harmful ingredients, but nutritionally poor — okay occasionally, not as a regular choice.",
+        { size: 9, color: MUTED, gapAfter: 4 },
+      );
+    } else if (a.verdict === "safe" && nScore != null && nScore <= 75) {
+      R.paragraph(
+        "Fine to eat — nothing harmful — though less refined versions are more nutritious.",
+        { size: 9, color: MUTED, gapAfter: 4 },
+      );
+    }
   }
   if (oa?.recommendation) {
     R.paragraph(oa.recommendation, { size: 9, color: MUTED });

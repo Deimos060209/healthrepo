@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
 import { anthropic, HAIKU_MODEL } from "@/lib/claude";
+import { anthropicPreflight, handleAnthropicError } from "@/lib/anthropic-errors";
 
 // Vision on a single image is quick; this is well under the Hobby cap.
 export const maxDuration = 30;
@@ -77,6 +78,9 @@ export async function POST(request: Request) {
     );
   }
 
+  const preflight = anthropicPreflight("extract-text");
+  if (preflight) return preflight;
+
   let extractedText: string;
   try {
     const message = await anthropic.messages.create({
@@ -114,23 +118,19 @@ export async function POST(request: Request) {
       .join("")
       .trim();
   } catch (err) {
-    if (err instanceof Anthropic.AuthenticationError) {
-      return jsonError("Enhanced reading is not configured correctly.", 500);
-    }
-    if (err instanceof Anthropic.RateLimitError) {
-      return jsonError("Enhanced reading is busy. Try again in a moment.", 429);
-    }
-    if (err instanceof Anthropic.BadRequestError) {
+    // Recognised infrastructure outages (credits, rate limit, overload, key,
+    // connectivity) -> specific code + retryable flag, raw message never leaked.
+    const outage = handleAnthropicError(err, "extract-text");
+    if (outage) return outage;
+    if (
+      err instanceof Anthropic.BadRequestError ||
+      err instanceof Anthropic.UnprocessableEntityError
+    ) {
       // Almost always an unreadable or unsupported image.
       return jsonError(
         "That image could not be read. Retake the photo in good light.",
         422,
       );
-    }
-    if (err instanceof Anthropic.APIError) {
-      return jsonError("The enhanced reading service failed to respond.", 502, {
-        detail: err.message,
-      });
     }
     return jsonError("Unexpected error during enhanced reading.", 500);
   }

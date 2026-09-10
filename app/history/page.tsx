@@ -28,7 +28,26 @@ interface ScanRow {
   compliance_details: Record<string, ComplianceItem> | null;
   ingredient_analysis: IngredientAnalysis[] | null;
   overall_score: number | null;
+  /** scoring-model-v2 columns — null on rows scored before the nutrition layer. */
+  safety_score: number | null;
+  nutrition_score: number | null;
+  compliance_score: number | null;
+  verdict: string | null;
+  scan_version: number | null;
   scanned_at: string;
+}
+
+const BASE_COLS =
+  "id, product_name, brand, category, image_url, compliance_status, compliance_details, ingredient_analysis, overall_score, scanned_at";
+const V2_COLS = `${BASE_COLS}, safety_score, nutrition_score, compliance_score, verdict, scan_version`;
+
+/** True when a query failed only because a column does not exist yet. */
+function isUnknownColumn(e: { code?: string; message?: string } | null): boolean {
+  if (!e) return false;
+  if (e.code === "42703" || e.code === "PGRST204") return true;
+  return /column .* does not exist|could not find the .* column/i.test(
+    e.message ?? "",
+  );
 }
 
 /**
@@ -68,6 +87,67 @@ function scoreBadge(score: number | null): { bg: string; value: string } {
   if (s >= 80) return { bg: "bg-green-500", value: String(s) };
   if (s >= 50) return { bg: "bg-amber-500", value: String(s) };
   return { bg: "bg-red-600", value: String(s) };
+}
+
+/** Small S/N/C chip colour by score. `null` (e.g. nutrition on non-food) is muted. */
+function chipCls(score: number | null): string {
+  if (score == null)
+    return "bg-zinc-100 text-zinc-400 dark:bg-white/5 dark:text-zinc-500";
+  const s = Math.max(0, Math.min(100, Math.round(score)));
+  if (s >= 80)
+    return "bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300";
+  if (s >= 50)
+    return "bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300";
+  return "bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-300";
+}
+
+function ScoreChips({ row }: { row: ScanRow }) {
+  // A v2 scan carries the three dimensions; a v1 scan only has the (legacy
+  // safety) overall_score.
+  const isV2 = (row.scan_version ?? 1) >= 2 && row.safety_score != null;
+  if (!isV2) {
+    return (
+      <div className="mt-1 flex flex-col gap-0.5">
+        <span
+          className={`w-fit rounded-md px-1.5 py-0.5 text-[10px] font-bold tabular-nums ${chipCls(
+            row.overall_score,
+          )}`}
+        >
+          {row.overall_score == null ? "—" : Math.round(row.overall_score)} safety
+        </span>
+        <span className="text-[9px] leading-tight text-zinc-400">
+          Scanned before nutritional analysis was added
+        </span>
+      </div>
+    );
+  }
+  const chips: [string, number | null][] = [
+    ["S", row.safety_score],
+    ["N", row.nutrition_score],
+    ["C", row.compliance_score],
+  ];
+  return (
+    <div className="mt-1 flex gap-1">
+      {chips.map(([label, val]) => (
+        <span
+          key={label}
+          title={
+            label === "S"
+              ? "Safety"
+              : label === "N"
+                ? "Nutrition"
+                : "Compliance"
+          }
+          className={`flex items-baseline gap-0.5 rounded-md px-1.5 py-0.5 text-[10px] font-bold tabular-nums ${chipCls(
+            val,
+          )}`}
+        >
+          <span className="opacity-60">{label}</span>
+          {val == null ? "—" : Math.round(val)}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 function relativeTime(iso: string): string {
@@ -118,13 +198,23 @@ export default function HistoryPage() {
 
     (async () => {
       try {
-        const { data, error } = await supabase
+        const q1 = await supabase
           .from("scanned_products")
-          .select(
-            "id, product_name, brand, category, image_url, compliance_status, compliance_details, ingredient_analysis, overall_score, scanned_at",
-          )
+          .select(V2_COLS)
           .eq("user_id", user.id)
           .order("scanned_at", { ascending: false });
+        let data: unknown[] | null = q1.data;
+        let error = q1.error;
+        // Pre-migration DB: retry with just the columns it knows.
+        if (error && isUnknownColumn(error)) {
+          const q2 = await supabase
+            .from("scanned_products")
+            .select(BASE_COLS)
+            .eq("user_id", user.id)
+            .order("scanned_at", { ascending: false });
+          data = q2.data;
+          error = q2.error;
+        }
         if (!alive) return;
 
         if (error) {
@@ -342,6 +432,7 @@ function ProductCard({ row }: { row: ScanRow }) {
           <span className="mt-1 w-fit rounded-full bg-zinc-100 px-2 py-0.5 text-[10px] font-medium text-zinc-600 dark:bg-white/10 dark:text-zinc-300">
             {catLabel}
           </span>
+          <ScoreChips row={row} />
           <div className="mt-auto flex items-center justify-between pt-2">
             <span className="text-[11px] text-zinc-400">
               {relativeTime(row.scanned_at)}

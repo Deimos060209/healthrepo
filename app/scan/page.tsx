@@ -28,6 +28,8 @@ import {
   Frown,
   Package,
   FileText,
+  Hourglass,
+  Wheat,
 } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { useToast } from "@/components/ToastProvider";
@@ -61,6 +63,8 @@ import type {
   PersonalFlagSeverity,
   Verdict,
 } from "@/types/analysis";
+import { NutritionSection } from "@/components/NutritionSection";
+import { isFoodCategory } from "@/lib/enrich-analysis";
 
 // ---------------------------------------------------------------------------
 // Local helpers
@@ -171,6 +175,204 @@ function analysisKey(text: string, hasProfile: boolean): string {
   return `${s.length}:${h}:${hasProfile ? "hp" : "no"}`;
 }
 
+// ---------------------------------------------------------------------------
+// Analysis-service failure handling
+// ---------------------------------------------------------------------------
+//
+// The API routes now return a specific code for each way an Anthropic call can
+// fail — `{ error, retryable, retry_after_seconds? }` — instead of one generic
+// "couldn't reach the service". We turn that into user-facing copy here.
+//
+//   out_of_credits  usage limit reached — retrying cannot help, no retry button
+//   rate_limited    too many scans — count down `retry_after_seconds`, then retry
+//   overloaded      service busy — retried automatically before it ever shows
+//   auth_error      key is broken — operator problem, don't tell the user to retry
+//   network_error / timeout   genuinely connectivity — keep the old wording
+
+type AnalysisErrorCode =
+  | "out_of_credits"
+  | "rate_limited"
+  | "overloaded"
+  | "auth_error"
+  | "network_error"
+  | "timeout"
+  | "generic";
+
+interface AnalysisError {
+  code: AnalysisErrorCode;
+  message: string;
+  hint?: string;
+  retryable: boolean;
+  retryAfter?: number;
+}
+
+const ERROR_COPY: Record<
+  Exclude<AnalysisErrorCode, "generic">,
+  { message: string; hint?: string; retryable: boolean }
+> = {
+  out_of_credits: {
+    message: "⚠️ Analysis is temporarily unavailable",
+    hint: "HealthRepo has reached its usage limit for now. Please try again later.",
+    retryable: false,
+  },
+  rate_limited: {
+    message: "Too many scans right now — please wait a moment",
+    hint: "Your extracted text is saved. Try again shortly.",
+    retryable: true,
+  },
+  overloaded: {
+    message: "The analysis service is busy",
+    hint: "It didn't respond after a few automatic retries. Give it a moment and try again.",
+    retryable: true,
+  },
+  auth_error: {
+    message: "Analysis is temporarily unavailable. Please try again later.",
+    retryable: false,
+  },
+  network_error: {
+    message: "Could not reach the analysis service.",
+    hint: "Check your connection and try again.",
+    retryable: true,
+  },
+  timeout: {
+    message: "The analysis service took too long to respond.",
+    hint: "Check your connection and try again.",
+    retryable: true,
+  },
+};
+
+/** Turn an /api/analyze (or /api/extract-*) error body into display copy. */
+function mapAnalysisError(data: unknown): AnalysisError {
+  const body = (data ?? {}) as {
+    error?: unknown;
+    retryable?: unknown;
+    retry_after_seconds?: unknown;
+  };
+  const code = typeof body.error === "string" ? body.error : "";
+  const known = (ERROR_COPY as Record<string, (typeof ERROR_COPY)[keyof typeof ERROR_COPY]>)[code];
+  if (known) {
+    return {
+      code: code as AnalysisErrorCode,
+      message: known.message,
+      hint: known.hint,
+      retryable:
+        typeof body.retryable === "boolean" ? body.retryable : known.retryable,
+      retryAfter:
+        typeof body.retry_after_seconds === "number" &&
+        body.retry_after_seconds > 0
+          ? Math.ceil(body.retry_after_seconds)
+          : undefined,
+    };
+  }
+  // Legacy / validation errors still send `error` as a human sentence.
+  return {
+    code: "generic",
+    message: code || "The analysis service failed to respond.",
+    hint: "Check your connection and try again.",
+    retryable: true,
+  };
+}
+
+/** One-line toast copy for the secondary re-analyse flows. */
+function analysisErrorToast(data: unknown): string {
+  const e = mapAnalysisError(data);
+  switch (e.code) {
+    case "out_of_credits":
+      return "Analysis is temporarily unavailable — usage limit reached. Try again later.";
+    case "rate_limited":
+      return "Too many scans right now — wait a moment and try again.";
+    case "overloaded":
+      return "The analysis service is busy. Try again in a moment.";
+    case "auth_error":
+      return "Analysis is temporarily unavailable. Please try again later.";
+    default:
+      return e.message;
+  }
+}
+
+type AnalyzeOutcome =
+  | { kind: "ok"; analysis: ProductAnalysis }
+  | { kind: "special"; view: "notpackaged" | "garbled"; data: Record<string, unknown> }
+  | { kind: "error"; error: AnalysisError };
+
+/**
+ * POST /api/analyze with two built-in behaviours the spec calls for:
+ *  - a transient `overloaded` is retried automatically (2s then 5s) before it
+ *    is ever shown to the user;
+ *  - every other failure comes back as a typed {@link AnalysisError} rather than
+ *    a thrown exception, so the caller never has to guess.
+ * The caller keeps ownership of the extracted text, so a returned error loses
+ * nothing — "Try again" re-sends the same text with no OCR/vision re-run.
+ */
+async function requestAnalysis(
+  payload: Record<string, unknown>,
+  onAutoRetry?: (attempt: number) => void,
+): Promise<AnalyzeOutcome> {
+  const OVERLOAD_BACKOFF_MS = [2000, 5000];
+
+  for (let attempt = 0; ; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), ANALYSIS_TIMEOUT_MS);
+    let res: Response;
+    let data: Record<string, unknown>;
+    try {
+      res = await fetch("/api/analyze", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+    } catch (err) {
+      clearTimeout(timeout);
+      if (err instanceof DOMException && err.name === "AbortError") {
+        return {
+          kind: "error",
+          error: {
+            code: "timeout",
+            message:
+              "The analysis took too long and was stopped before it could run up a charge.",
+            hint: "Try again, or scan a smaller portion of the label.",
+            retryable: true,
+          },
+        };
+      }
+      return {
+        kind: "error",
+        error: {
+          code: "network_error",
+          message: "Could not reach the analysis service.",
+          hint: "Check your connection and try again.",
+          retryable: true,
+        },
+      };
+    }
+    clearTimeout(timeout);
+
+    if (res.status === 422 && data?.error === "not_a_packaged_product") {
+      return { kind: "special", view: "notpackaged", data };
+    }
+    if (res.status === 422 && data?.error === "garbled_text") {
+      return { kind: "special", view: "garbled", data };
+    }
+    if (res.ok && data?.analysis) {
+      return { kind: "ok", analysis: data.analysis as ProductAnalysis };
+    }
+
+    // Auto-retry a genuine overload a couple of times before surfacing anything.
+    if (
+      data?.error === "overloaded" &&
+      attempt < OVERLOAD_BACKOFF_MS.length
+    ) {
+      onAutoRetry?.(attempt + 1);
+      await sleep(OVERLOAD_BACKOFF_MS[attempt]);
+      continue;
+    }
+
+    return { kind: "error", error: mapAnalysisError(data) };
+  }
+}
+
 /**
  * True when a Supabase write failed only because a column in the payload does
  * not exist on this database yet (a pending migration). Lets saveScan retry
@@ -183,6 +385,72 @@ function isMissingColumnError(e: unknown): boolean {
   return /could not find the '.*' column|column ".*" of relation|column .* does not exist/i.test(
     err.message ?? "",
   );
+}
+
+/**
+ * The scoring-model-v2 columns written on every save. overall_score now holds
+ * the WEIGHTED overall (safety x0.35 + nutrition x0.50 + compliance x0.15) that
+ * enrichAnalysis already computed — no longer the safety score. nutrition_score
+ * is null for non-food. scan_version 2 marks a row as carrying the full
+ * nutritional layer. See migration 20260909040000.
+ */
+function scoreColumns(a: ProductAnalysis): Record<string, unknown> {
+  const oa = a.overall_assessment;
+  const asInt = (v: number | null | undefined) =>
+    v == null ? null : Math.max(0, Math.min(100, Math.round(v)));
+  return {
+    safety_score: asInt(oa?.safety_score),
+    nutrition_score: asInt(oa?.nutrition_score ?? null),
+    compliance_score: asInt(oa?.compliance_score),
+    overall_score:
+      asInt(oa?.overall_score) ?? asInt(oa?.safety_score) ?? 0,
+    verdict: a.verdict ?? null,
+    nutritional_analysis: a.nutritional_analysis ?? {},
+    primary_concern: a.nutritional_analysis?.primary_concern ?? {},
+    scan_version: 2,
+  };
+}
+
+/** v2-optional columns that a pre-migration database rejects. */
+const V2_OPTIONAL_COLUMNS = [
+  "detected_category",
+  "dosage_analysis",
+  "personal_alerts",
+  "safety_score",
+  "nutrition_score",
+  "compliance_score",
+  "verdict",
+  "nutritional_analysis",
+  "primary_concern",
+  "scan_version",
+] as const;
+
+/**
+ * UPDATE a saved scan row, and — if the database predates a migration — retry
+ * without the columns it does not know, keeping overall_score at its pre-v2
+ * (safety) meaning so an old DB is never misread.
+ */
+async function syncSavedRow(
+  id: string,
+  patch: Record<string, unknown>,
+): Promise<void> {
+  let { error } = await supabase
+    .from("scanned_products")
+    .update(patch)
+    .eq("id", id);
+  if (error && isMissingColumnError(error)) {
+    const base = { ...patch };
+    for (const c of V2_OPTIONAL_COLUMNS) delete base[c];
+    if ("overall_score" in patch) {
+      const s = patch.safety_score;
+      if (typeof s === "number") base.overall_score = s;
+    }
+    ({ error } = await supabase
+      .from("scanned_products")
+      .update(base)
+      .eq("id", id));
+  }
+  if (error) console.error("[syncSavedRow] update failed:", error);
 }
 
 const titleCase = (s: string) =>
@@ -245,11 +513,38 @@ const COMPLIANCE_BADGE = {
 
 function scoreBand(score: number) {
   if (score >= 80)
-    return { label: "Safe", stroke: "stroke-green-500", text: "text-green-600 dark:text-green-400" };
+    return {
+      label: "Safe",
+      stroke: "stroke-green-500",
+      text: "text-green-600 dark:text-green-400",
+      bar: "bg-green-500",
+    };
   if (score >= 50)
-    return { label: "Caution", stroke: "stroke-amber-500", text: "text-amber-600 dark:text-amber-400" };
-  return { label: "Unsafe", stroke: "stroke-red-600", text: "text-red-600 dark:text-red-400" };
+    return {
+      label: "Caution",
+      stroke: "stroke-amber-500",
+      text: "text-amber-600 dark:text-amber-400",
+      bar: "bg-amber-500",
+    };
+  return {
+    label: "Unsafe",
+    stroke: "stroke-red-600",
+    text: "text-red-600 dark:text-red-400",
+    bar: "bg-red-600",
+  };
 }
+
+/** Nutrition concern-type labels (also used by the shared NutritionSection). */
+const CONCERN_TYPE_LABEL: Record<string, string> = {
+  refined_grain: "Refined grain",
+  added_sugar: "Added sugar",
+  refined_oil: "Refined oil",
+  high_sodium: "High sodium",
+  saturated_fat: "Saturated fat",
+  trans_fat: "Trans fat",
+  processed_protein: "Processed meat",
+  low_nutrient_density: "Low nutrient density",
+};
 
 const STATUS_STYLE: Record<
   SafetyStatus,
@@ -366,9 +661,10 @@ export default function ScanPage() {
   const [view, setView] = useState<View>("capture");
   const [steps, setSteps] = useState<Steps>(IDLE_STEPS);
   const [ocrProgress, setOcrProgress] = useState(0);
-  const [errInfo, setErrInfo] = useState<{ message: string; hint?: string } | null>(
-    null,
-  );
+  const [errInfo, setErrInfo] = useState<AnalysisError | null>(null);
+  // Live countdown for a `rate_limited` error — the "Try again" button stays
+  // disabled until it reaches zero.
+  const [retryIn, setRetryIn] = useState(0);
   const [garbled, setGarbled] = useState<{
     message: string;
     recommendation: string;
@@ -429,6 +725,26 @@ export default function ScanPage() {
     },
     [],
   );
+
+  // Tick down the wait after a `rate_limited` error; "Try again" is disabled
+  // until this hits zero.
+  useEffect(() => {
+    if (view !== "error" || errInfo?.code !== "rate_limited") {
+      setRetryIn(0);
+      return;
+    }
+    setRetryIn(errInfo.retryAfter ?? 20);
+    const id = setInterval(() => {
+      setRetryIn((s) => {
+        if (s <= 1) {
+          clearInterval(id);
+          return 0;
+        }
+        return s - 1;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [view, errInfo]);
 
   const resetCategoryReview = useCallback(() => {
     setCategoryConfirmed(false);
@@ -515,23 +831,22 @@ export default function ScanPage() {
       if (cached && Date.now() - cached.at < ANALYSIS_DEDUPE_MS) {
         analysis = cached.analysis;
       } else {
-        const controller = new AbortController();
-        const timeout = setTimeout(
-          () => controller.abort(),
-          ANALYSIS_TIMEOUT_MS,
+        const outcome = await requestAnalysis(
+          { extractedText: sourceText, userHealthProfile },
+          () => {
+            // Auto-retrying a transient overload — keep the user on the
+            // progress screen with an honest note rather than an error.
+            setErrInfo({
+              code: "overloaded",
+              message: "The analysis service is busy. Retrying automatically…",
+              retryable: true,
+            });
+          },
         );
-        try {
-          const res = await fetch("/api/analyze", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ extractedText: sourceText, userHealthProfile }),
-            signal: controller.signal,
-          });
-          const data = await res.json();
 
-          // The router decided the photo isn't a labelled package at all —
-          // no Sonnet call, no score, nothing saved.
-          if (res.status === 422 && data?.error === "not_a_packaged_product") {
+        if (outcome.kind === "special") {
+          const data = outcome.data;
+          if (outcome.view === "notpackaged") {
             setNotPackaged({
               detected:
                 typeof data.detected === "string" && data.detected.trim()
@@ -546,59 +861,45 @@ export default function ScanPage() {
             setView("notpackaged");
             return;
           }
+          setGarbled({
+            message:
+              typeof data.message === "string" && data.message.trim()
+                ? data.message
+                : "The extracted text appears corrupted.",
+            recommendation:
+              typeof data.recommendation === "string" &&
+              data.recommendation.trim()
+                ? data.recommendation
+                : "Please retake the photo.",
+          });
+          setSteps((s) => ({ ...s, analyze: "done" }));
+          setView("garbled");
+          return;
+        }
 
-          // Claude judged the text unreadable and refused to analyse it.
-          if (res.status === 422 && data?.error === "garbled_text") {
-            setGarbled({
-              message:
-                typeof data.message === "string" && data.message.trim()
-                  ? data.message
-                  : "The extracted text appears corrupted.",
-              recommendation:
-                typeof data.recommendation === "string" &&
-                data.recommendation.trim()
-                  ? data.recommendation
-                  : "Please retake the photo.",
-            });
-            setSteps((s) => ({ ...s, analyze: "done" }));
-            setView("garbled");
-            return;
-          }
-
-          if (!res.ok) {
-            setErrInfo({
-              message: data?.error ?? "The analysis service failed to respond.",
-              hint: "Check your connection and try again.",
-            });
-            setView("error");
-            return;
-          }
-          analysis = data.analysis as ProductAnalysis;
-          recentAnalyses.set(dedupeKey, { at: Date.now(), analysis });
-        } catch (err) {
-          setErrInfo(
-            err instanceof DOMException && err.name === "AbortError"
-              ? {
-                  message:
-                    "The analysis took too long and was stopped before it could run up a charge.",
-                  hint: "Try again, or scan a smaller portion of the label.",
-                }
-              : {
-                  message: "Could not reach the analysis service.",
-                  hint: "Check your connection and try again.",
-                },
-          );
+        if (outcome.kind === "error") {
+          // The extracted text stays in `extracted` state — "Try again" from
+          // the error screen re-sends it with no OCR/vision re-run.
+          setErrInfo(outcome.error);
           setView("error");
           return;
-        } finally {
-          clearTimeout(timeout);
         }
+
+        analysis = outcome.analysis;
+        recentAnalyses.set(dedupeKey, { at: Date.now(), analysis });
       }
       if (!analysis || typeof analysis !== "object") {
-        setErrInfo({ message: "The analysis came back empty. Please try again." });
+        setErrInfo({
+          code: "generic",
+          message: "The analysis came back empty. Please try again.",
+          retryable: true,
+        });
         setView("error");
         return;
       }
+      // A retryable overload note may have been set mid-flight — clear it now
+      // that we have a result.
+      setErrInfo(null);
 
       setSteps((s) => ({ ...s, analyze: "done", report: "active" }));
       await sleep(600);
@@ -677,7 +978,9 @@ export default function ScanPage() {
             err instanceof OcrError &&
             (err.code === "INVALID_FILE" || err.code === "FILE_TOO_LARGE")
           ) {
-            setErrInfo(mapOcrError(err));
+            // A bad file (too large / not an image) — "Try again" on the same
+            // file cannot help, so only offer "Change photo".
+            setErrInfo({ code: "generic", retryable: false, ...mapOcrError(err) });
             setView("error");
             return;
           }
@@ -737,6 +1040,10 @@ export default function ScanPage() {
 
       const attempted = { tesseract: !forceVision, haiku: false, sonnet: false };
       const tesseractScore = validateExtractedText(tesseractText).score;
+      // Set if a vision tier reports a hard Anthropic outage (out of credits /
+      // broken key). The analyse call would hit the same wall, so we surface it
+      // straight away instead of falling through to "couldn't read the image".
+      let hardOutage: AnalysisError | null = null;
 
       // ---- TIER 2: Haiku Vision ----
       // Any failure here (throw, timeout, non-200) is swallowed and we escalate
@@ -767,6 +1074,11 @@ export default function ScanPage() {
           });
           if (res.ok && typeof data.extractedText === "string") {
             haikuText = data.extractedText.trim();
+          } else if (
+            data?.error === "out_of_credits" ||
+            data?.error === "auth_error"
+          ) {
+            hardOutage = mapAnalysisError(data);
           }
         } catch (err) {
           console.warn("[ocr] tier2 haiku threw / timed out:", err);
@@ -775,6 +1087,14 @@ export default function ScanPage() {
         }
       } else {
         console.warn("[ocr] tier2 haiku skipped — no image payload");
+      }
+
+      // No point trying the (equally credit-dependent) advanced reader.
+      if (hardOutage && !haikuText) {
+        setSteps((s) => ({ ...s, enhance: "done" }));
+        setErrInfo(hardOutage);
+        setView("error");
+        return;
       }
 
       // Vision output is trusted at a LOWER bar than Tesseract (>= 2, not 3).
@@ -816,6 +1136,11 @@ export default function ScanPage() {
           });
           if (res.ok && typeof data.extractedText === "string") {
             sonnetText = data.extractedText.trim();
+          } else if (
+            data?.error === "out_of_credits" ||
+            data?.error === "auth_error"
+          ) {
+            hardOutage = mapAnalysisError(data);
           }
           if (Array.isArray(data?.unreadableFields)) {
             sonnetUnreadable = data.unreadableFields
@@ -851,6 +1176,14 @@ export default function ScanPage() {
         return;
       }
 
+      // A hard Anthropic outage with nothing usable from any tier — show that,
+      // not "we couldn't read the image".
+      if (hardOutage && !sonnetText && !haikuText && !tesseractText.trim()) {
+        setErrInfo(hardOutage);
+        setView("error");
+        return;
+      }
+
       // Salvage: fall back to the best text an earlier tier produced before
       // giving up. Vision text clears the >= 2 bar; Tesseract still needs >= 2.
       const salvage: { text: string; tier: Tier } | null =
@@ -883,6 +1216,31 @@ export default function ScanPage() {
     },
     [file, analyzeText, resetCategoryReview],
   );
+
+  // --- retry after a service failure --------------------------------------
+  // Preserve the user's work: if text was already extracted, re-send THAT to
+  // /api/analyze — no OCR, no vision, no cost for reading the label again.
+  // Only fall back to the full pipeline when we never got any text out.
+  const retryAnalysis = useCallback(async () => {
+    setErrInfo(null);
+    if (extracted?.text) {
+      setView("processing");
+      setSteps({
+        ...IDLE_STEPS,
+        ocr: "done",
+        verify: "done",
+        enhance:
+          extracted.tier === "haiku" || extracted.tier === "sonnet"
+            ? "done"
+            : "idle",
+        advanced: extracted.tier === "sonnet" ? "done" : "idle",
+        analyze: "active",
+      });
+      await analyzeText(extracted.text, extracted.tier);
+      return;
+    }
+    await runAnalysis();
+  }, [extracted, analyzeText, runAnalysis]);
 
   // --- manual entry -> analyze ----------------------------------------
   const submitManual = useCallback(async () => {
@@ -922,10 +1280,6 @@ export default function ScanPage() {
       }
 
       const pi = analysis.product_info ?? ({} as ProductAnalysis["product_info"]);
-      const score = Math.max(
-        0,
-        Math.min(100, Math.round(analysis.overall_assessment?.safety_score ?? 0)),
-      );
 
       // Best-effort — a failed upload still saves the analysis, just without a photo.
       const imageUrl = await uploadProductImage(imageFile, user.id);
@@ -944,7 +1298,7 @@ export default function ScanPage() {
         dosage_analysis: analysis.dosage_analysis ?? {},
         personal_alerts: analysis.personal_alerts ?? [],
         healthier_alternatives: buildAlternatives(analysis),
-        overall_score: score,
+        ...scoreColumns(analysis),
       };
 
       let { data, error } = await supabase
@@ -955,7 +1309,9 @@ export default function ScanPage() {
 
       // Resilience: on a database that predates the newer migrations, PostgREST
       // rejects the WHOLE insert because one column is unknown (PGRST204). Retry
-      // without the optional columns so the scan still lands in history.
+      // without the optional columns so the scan still lands in history. The
+      // scoring-model-v2 columns are stripped too, and overall_score falls back
+      // to the safety score (its pre-v2 meaning) so an old DB is not misread.
       if (error && isMissingColumnError(error)) {
         console.error(
           "[saveScan] insert rejected for an unknown column — retrying with base columns only:",
@@ -965,6 +1321,16 @@ export default function ScanPage() {
         delete baseRow.detected_category;
         delete baseRow.dosage_analysis;
         delete baseRow.personal_alerts;
+        delete baseRow.safety_score;
+        delete baseRow.nutrition_score;
+        delete baseRow.compliance_score;
+        delete baseRow.verdict;
+        delete baseRow.nutritional_analysis;
+        delete baseRow.primary_concern;
+        delete baseRow.scan_version;
+        baseRow.overall_score = clampScore(
+          analysis.overall_assessment?.safety_score,
+        );
         ({ data, error } = await supabase
           .from("scanned_products")
           .insert(baseRow)
@@ -1007,7 +1373,7 @@ export default function ScanPage() {
         });
         data = await res.json();
         if (!res.ok || !data?.analysis) {
-          toast.error("Could not re-analyze with that category. Try again.");
+          toast.error(analysisErrorToast(data));
           return;
         }
       } finally {
@@ -1023,20 +1389,17 @@ export default function ScanPage() {
       // Keep the saved row in sync so history / search / PDF reflect the change.
       if (save.state === "saved" && save.id) {
         const pi = analysis.product_info ?? ({} as ProductAnalysis["product_info"]);
-        await supabase
-          .from("scanned_products")
-          .update({
-            category: pi.category ?? "uncategorized",
-            detected_category: analysis.detected_category ?? null,
-            compliance_status: deriveComplianceStatus(analysis),
-            compliance_details: analysis.legal_metrology_compliance ?? {},
-            ingredient_analysis: analysis.ingredient_analysis ?? [],
-            dosage_analysis: analysis.dosage_analysis ?? {},
-            personal_alerts: analysis.personal_alerts ?? [],
-            healthier_alternatives: buildAlternatives(analysis),
-            overall_score: clampScore(analysis.overall_assessment?.safety_score),
-          })
-          .eq("id", save.id);
+        await syncSavedRow(save.id, {
+          category: pi.category ?? "uncategorized",
+          detected_category: analysis.detected_category ?? null,
+          compliance_status: deriveComplianceStatus(analysis),
+          compliance_details: analysis.legal_metrology_compliance ?? {},
+          ingredient_analysis: analysis.ingredient_analysis ?? [],
+          dosage_analysis: analysis.dosage_analysis ?? {},
+          personal_alerts: analysis.personal_alerts ?? [],
+          healthier_alternatives: buildAlternatives(analysis),
+          ...scoreColumns(analysis),
+        });
       }
       toast.success("Re-analyzed for the selected category.");
     } catch {
@@ -1066,7 +1429,7 @@ export default function ScanPage() {
         });
         data = await res.json();
         if (!res.ok || !data?.analysis) {
-          toast.error("Could not re-analyse. Try again.");
+          toast.error(analysisErrorToast(data));
           return;
         }
       } finally {
@@ -1088,23 +1451,20 @@ export default function ScanPage() {
       } else if (save.state === "saved" && save.id) {
         const pi =
           analysis.product_info ?? ({} as ProductAnalysis["product_info"]);
-        await supabase
-          .from("scanned_products")
-          .update({
-            product_name: pi.name ?? "Unknown product",
-            brand: pi.brand,
-            category: pi.category ?? "uncategorized",
-            detected_category: analysis.detected_category ?? null,
-            extracted_text: text,
-            compliance_status: deriveComplianceStatus(analysis),
-            compliance_details: analysis.legal_metrology_compliance ?? {},
-            ingredient_analysis: analysis.ingredient_analysis ?? [],
-            dosage_analysis: analysis.dosage_analysis ?? {},
-            personal_alerts: analysis.personal_alerts ?? [],
-            healthier_alternatives: buildAlternatives(analysis),
-            overall_score: clampScore(analysis.overall_assessment?.safety_score),
-          })
-          .eq("id", save.id);
+        await syncSavedRow(save.id, {
+          product_name: pi.name ?? "Unknown product",
+          brand: pi.brand,
+          category: pi.category ?? "uncategorized",
+          detected_category: analysis.detected_category ?? null,
+          extracted_text: text,
+          compliance_status: deriveComplianceStatus(analysis),
+          compliance_details: analysis.legal_metrology_compliance ?? {},
+          ingredient_analysis: analysis.ingredient_analysis ?? [],
+          dosage_analysis: analysis.dosage_analysis ?? {},
+          personal_alerts: analysis.personal_alerts ?? [],
+          healthier_alternatives: buildAlternatives(analysis),
+          ...scoreColumns(analysis),
+        });
       } else if (file) {
         void saveScan(analysis, text, file);
       }
@@ -1194,9 +1554,47 @@ export default function ScanPage() {
       fallbackFindings.push("High overall additive load");
     if (fallbackFindings.length === 0)
       fallbackFindings.push("No harmful or banned ingredients found");
-    const keyFindings = (
-      modelFindings.length ? modelFindings : fallbackFindings
-    ).slice(0, 4);
+
+    // "What you should know" must draw from BOTH dimensions — a clean safety
+    // record is only half the story for a food.
+    const nutritionFindings: string[] = [];
+    const n = a.nutritional_analysis;
+    if (n) {
+      if (n.primary_concern)
+        nutritionFindings.push(`Primary concern: ${n.primary_concern.explanation}`);
+      const worst = n.concerns.find((c) => c.concern_level === "significant");
+      const highs = n.threshold_flags.filter(
+        (f) => f.level === "high" || f.level === "very_high",
+      );
+      if (highs.length)
+        nutritionFindings.push(
+          highs
+            .map((f) => `High ${f.nutrient.toLowerCase()}: ${f.value_per_100}${f.unit} per 100`)
+            .join(" · "),
+        );
+      if (n.sugar_alias_count >= 3)
+        nutritionFindings.push(
+          `Sugar listed under ${n.sugar_alias_count} different names`,
+        );
+      if (n.is_ultra_processed) nutritionFindings.push("Ultra-processed food");
+      if (worst)
+        nutritionFindings.push(
+          `Made with ${worst.ingredient.toLowerCase()} — ${CONCERN_TYPE_LABEL[worst.concern_type]?.toLowerCase() ?? "a nutritional concern"}`,
+        );
+      else if (n.concerns.length)
+        nutritionFindings.push(
+          `${n.concerns.length} nutritional concern${n.concerns.length > 1 ? "s" : ""} in the ingredients`,
+        );
+    }
+
+    const base = modelFindings.length ? modelFindings : fallbackFindings;
+    // Only append what the model has not already said.
+    const said = base.map((s) => s.toLowerCase());
+    const extra = nutritionFindings.filter((f) => {
+      const head = f.toLowerCase().split(/[:—-]/)[0].trim();
+      return !said.some((s) => s.includes(head));
+    });
+    const keyFindings = [...base, ...extra].slice(0, 5);
 
     return {
       a,
@@ -1441,50 +1839,102 @@ export default function ScanPage() {
             />
             <StepRow status={steps.report} label="📊 Generating your report…" />
           </ol>
+          {errInfo?.code === "overloaded" && (
+            <p className="flex items-center gap-2 rounded-xl border border-amber-500/30 bg-amber-500/[0.06] px-3 py-2 text-sm text-amber-800 dark:text-amber-200">
+              <Loader2 className="h-4 w-4 shrink-0 animate-spin" aria-hidden />
+              The analysis service is busy — retrying automatically…
+            </p>
+          )}
         </section>
       )}
 
       {/* ============ ERROR ============ */}
-      {view === "error" && errInfo && (
-        <section
-          role="alert"
-          className="flex flex-col gap-3 rounded-2xl border border-red-500/30 bg-red-500/[0.06] p-5"
-        >
-          <div className="flex items-start gap-2">
-            <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-red-600 dark:text-red-400" aria-hidden />
-            <div>
-              <p className="font-semibold text-red-700 dark:text-red-300">
-                {errInfo.message}
-              </p>
-              {errInfo.hint && (
-                <p className="mt-1 text-sm text-red-700/90 dark:text-red-300/90">
-                  {errInfo.hint}
+      {view === "error" && errInfo && (() => {
+        // Amber (wait, it's the service) vs red (connectivity / bad input).
+        const soft =
+          errInfo.code === "out_of_credits" ||
+          errInfo.code === "auth_error" ||
+          errInfo.code === "rate_limited" ||
+          errInfo.code === "overloaded";
+        const canRetry =
+          errInfo.retryable && (Boolean(extracted?.text) || Boolean(file));
+        return (
+          <section
+            role="alert"
+            className={`flex flex-col gap-3 rounded-2xl border p-5 ${
+              soft
+                ? "border-amber-500/40 bg-amber-500/[0.06]"
+                : "border-red-500/30 bg-red-500/[0.06]"
+            }`}
+          >
+            <div className="flex items-start gap-2">
+              <AlertTriangle
+                className={`mt-0.5 h-5 w-5 shrink-0 ${
+                  soft
+                    ? "text-amber-600 dark:text-amber-400"
+                    : "text-red-600 dark:text-red-400"
+                }`}
+                aria-hidden
+              />
+              <div>
+                <p
+                  className={`font-semibold ${
+                    soft
+                      ? "text-amber-800 dark:text-amber-200"
+                      : "text-red-700 dark:text-red-300"
+                  }`}
+                >
+                  {errInfo.message}
                 </p>
-              )}
+                {errInfo.hint && (
+                  <p
+                    className={`mt-1 text-sm ${
+                      soft
+                        ? "text-amber-800/90 dark:text-amber-200/90"
+                        : "text-red-700/90 dark:text-red-300/90"
+                    }`}
+                  >
+                    {errInfo.hint}
+                  </p>
+                )}
+                {canRetry && extracted?.text && (
+                  <p
+                    className={`mt-1 text-xs ${
+                      soft
+                        ? "text-amber-700/80 dark:text-amber-300/80"
+                        : "text-red-700/80 dark:text-red-300/80"
+                    }`}
+                  >
+                    Your scanned text is kept — retrying re-analyses it without
+                    re-reading the photo.
+                  </p>
+                )}
+              </div>
             </div>
-          </div>
-          <div className="flex flex-wrap gap-2">
-            {file && (
+            <div className="flex flex-wrap gap-2">
+              {canRetry && (
+                <button
+                  type="button"
+                  onClick={() => retryAnalysis()}
+                  disabled={retryIn > 0}
+                  className="inline-flex items-center gap-2 rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <RefreshCw className="h-4 w-4" aria-hidden />
+                  {retryIn > 0 ? `Try again in ${retryIn}s` : "Try again"}
+                </button>
+              )}
               <button
                 type="button"
-                onClick={() => runAnalysis()}
-                className="inline-flex items-center gap-2 rounded-xl bg-teal-600 px-4 py-2 text-sm font-semibold text-white"
+                onClick={reset}
+                className="inline-flex items-center gap-2 rounded-xl border border-zinc-300 px-4 py-2 text-sm font-medium dark:border-white/15"
               >
-                <RefreshCw className="h-4 w-4" aria-hidden />
-                Try again
+                <RotateCcw className="h-4 w-4" aria-hidden />
+                Change photo
               </button>
-            )}
-            <button
-              type="button"
-              onClick={reset}
-              className="inline-flex items-center gap-2 rounded-xl border border-zinc-300 px-4 py-2 text-sm font-medium dark:border-white/15"
-            >
-              <RotateCcw className="h-4 w-4" aria-hidden />
-              Change photo
-            </button>
-          </div>
-        </section>
-      )}
+            </div>
+          </section>
+        );
+      })()}
 
       {/* ============ GARBLED TEXT ============ */}
       {view === "garbled" && garbled && (
@@ -1997,6 +2447,34 @@ export default function ScanPage() {
             )}
           </Collapsible>
 
+          {/* c1) Nutritional quality — food categories only */}
+          {derived.a.nutritional_analysis && (
+            <Collapsible
+              title="Nutritional quality"
+              icon={
+                <Wheat
+                  className="h-4 w-4 text-teal-700 dark:text-teal-400"
+                  aria-hidden
+                />
+              }
+              badge={
+                <span
+                  className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold ${
+                    clampScore(derived.a.nutritional_analysis.nutrition_score) >= 65
+                      ? "bg-green-100 text-green-700 dark:bg-green-500/15 dark:text-green-300"
+                      : clampScore(derived.a.nutritional_analysis.nutrition_score) >= 40
+                        ? "bg-amber-100 text-amber-800 dark:bg-amber-500/15 dark:text-amber-300"
+                        : "bg-orange-100 text-orange-800 dark:bg-orange-500/15 dark:text-orange-300"
+                  }`}
+                >
+                  {clampScore(derived.a.nutritional_analysis.nutrition_score)}/100
+                </span>
+              }
+            >
+              <NutritionSection n={derived.a.nutritional_analysis} />
+            </Collapsible>
+          )}
+
           {/* c2) Additive dosage check */}
           <Collapsible
             title="Additive dosage check"
@@ -2257,45 +2735,9 @@ function StepRow({
   );
 }
 
-function SafetyGauge({ score }: { score: number }) {
-  const clamped = Math.max(0, Math.min(100, Math.round(score)));
-  const band = scoreBand(clamped);
-  const r = 52;
-  const c = 2 * Math.PI * r;
-  return (
-    <div className="relative h-32 w-32">
-      <svg viewBox="0 0 120 120" className="h-full w-full -rotate-90">
-        <circle
-          cx="60"
-          cy="60"
-          r={r}
-          fill="none"
-          strokeWidth="12"
-          className="stroke-zinc-200 dark:stroke-white/10"
-        />
-        <circle
-          cx="60"
-          cy="60"
-          r={r}
-          fill="none"
-          strokeWidth="12"
-          strokeLinecap="round"
-          strokeDasharray={c}
-          strokeDashoffset={c * (1 - clamped / 100)}
-          className={band.stroke}
-        />
-      </svg>
-      <div className="absolute inset-0 flex flex-col items-center justify-center">
-        <span className={`text-3xl font-extrabold tabular-nums ${band.text}`}>
-          {clamped}
-        </span>
-        <span className={`text-xs font-semibold uppercase tracking-wide ${band.text}`}>
-          {band.label}
-        </span>
-      </div>
-    </div>
-  );
-}
+// (The single circular SafetyGauge was replaced by ScoreStrip — three compact
+// scores side by side. `scoreBand().stroke` is kept for the history page,
+// which still renders a gauge from a stored row.)
 
 function ComplianceRow({ label, item }: { label: string; item: ComplianceItem }) {
   const state =
@@ -2666,6 +3108,12 @@ const VERDICT_META: Record<
     text: "text-amber-700 dark:text-amber-300",
     Icon: AlertTriangle,
   },
+  limit: {
+    label: "Okay occasionally",
+    card: "border-orange-500/50 bg-orange-500/[0.06] dark:bg-orange-500/[0.1]",
+    text: "text-orange-700 dark:text-orange-300",
+    Icon: Hourglass,
+  },
   avoid: {
     label: "Avoid this product",
     card: "border-red-500/60 bg-red-500/[0.06] dark:bg-red-500/[0.1]",
@@ -2674,34 +3122,209 @@ const VERDICT_META: Record<
   },
 };
 
-/** The top-of-results verdict card: big call, one-line reason, score gauge. */
+/** Sub-line under the verdict headline. 'limit' needs the explanation most. */
+const VERDICT_SUBLINE: Record<Verdict, string | null> = {
+  safe: null,
+  caution: null,
+  limit:
+    "No harmful ingredients, but nutritionally poor — okay occasionally, not as a regular choice.",
+  avoid: null,
+};
+
+const STAPLE_SPARING_RE =
+  /\b(oil|ghee|vanaspati|dalda|sugar|jaggery|gur|salt|namak|honey|syrup|molasses)\b/i;
+
+/**
+ * The verdict headline + sub-line, keyed off food_type as well as the score.
+ * Returns null to keep the plain VERDICT_META label (non-food, unscored, and
+ * the 'avoid' / 'limit' cases which VERDICT_META already words well).
+ */
+function verdictDisplay(
+  a: ProductAnalysis,
+): { label: string; subline: string | null } | null {
+  const n = a.nutritional_analysis;
+  const s = a.overall_assessment?.nutrition_score;
+  if (!n || s == null) return null;
+
+  // STAPLE INGREDIENT — a cooking input, never a "bad product".
+  if (n.food_type === "staple_ingredient") {
+    const sparing =
+      n.nutrient_density === "empty" ||
+      STAPLE_SPARING_RE.test(a.product_info?.name ?? "") ||
+      STAPLE_SPARING_RE.test(a.ingredient_analysis?.[0]?.name ?? "");
+    if (sparing) {
+      return {
+        label: "Use sparingly",
+        subline:
+          "A cooking staple that is calorie-dense with little else — use it as an ingredient, in small amounts.",
+      };
+    }
+    if (s >= 75) {
+      return {
+        label: "Good staple",
+        subline: "A sound everyday cooking ingredient.",
+      };
+    }
+    const alt = n.concerns[0]?.better_alternative;
+    return {
+      label: "Fine staple",
+      subline: `A normal, affordable staple — nothing to avoid.${
+        alt ? ` ${alt} is more nutritious.` : ""
+      }`,
+    };
+  }
+
+  // MINIMALLY PROCESSED and PROCESSED — the 'safe' band splits by score.
+  if (a.verdict !== "safe") return null;
+  if (s <= 75) {
+    return {
+      label: "Reasonable choice",
+      subline:
+        "Fine to eat — nothing harmful — though less refined versions are more nutritious.",
+    };
+  }
+  return { label: "Good choice", subline: null };
+}
+
+/**
+ * The three score dimensions, side by side and each tappable to expand.
+ * Non-food categories have no nutrition dimension, so they show two.
+ */
+function ScoreStrip({ a }: { a: ProductAnalysis }) {
+  const [open, setOpen] = useState<string | null>(null);
+  const oa = a.overall_assessment;
+  const isFood = isFoodCategory(a.detected_category?.category);
+
+  const tiles: {
+    key: string;
+    label: string;
+    score: number | null;
+    detail: string;
+  }[] = [
+    {
+      key: "safety",
+      label: "Safety",
+      score: oa?.safety_score ?? null,
+      detail:
+        "Banned substances and harmful additives only. A high safety score means nothing on this label is dangerous — it does not mean the product is nutritious.",
+    },
+    ...(isFood
+      ? [
+          {
+            key: "nutrition",
+            label: "Nutrition",
+            score: oa?.nutrition_score ?? null,
+            detail:
+              a.nutritional_analysis?.moderation_advice ||
+              "Nutritional quality: refined grains, added sugar, refined oils, sodium and processing level. Legal, additive-free ingredients still count here.",
+          },
+        ]
+      : []),
+    {
+      key: "compliance",
+      label: "Compliance",
+      score: oa?.compliance_score ?? null,
+      detail:
+        "Whether the pack carries every declaration the Legal Metrology (Packaged Commodities) Rules 2011 require.",
+    },
+  ];
+
+  const overall = oa?.overall_score ?? null;
+  const opened = tiles.find((t) => t.key === open);
+
+  return (
+    <div className="flex flex-col gap-2">
+      <div className="grid grid-cols-3 gap-2">
+        {tiles.map((t) => {
+          const band = t.score == null ? null : scoreBand(clampScore(t.score));
+          return (
+            <button
+              key={t.key}
+              type="button"
+              onClick={() => setOpen(open === t.key ? null : t.key)}
+              aria-expanded={open === t.key}
+              className={`flex flex-col items-center gap-0.5 rounded-xl border px-2 py-2.5 transition-colors ${
+                open === t.key
+                  ? "border-teal-500/60 bg-teal-500/[0.07]"
+                  : "border-zinc-200 dark:border-white/10"
+              }`}
+            >
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
+                {t.label}
+              </span>
+              <span
+                className={`text-2xl font-extrabold tabular-nums leading-none ${
+                  band ? band.text : "text-zinc-400"
+                }`}
+              >
+                {t.score == null ? "—" : clampScore(t.score)}
+              </span>
+              {t.score != null && (
+                <span className="h-1 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-white/10">
+                  <span
+                    className={`block h-full rounded-full ${band?.bar ?? ""}`}
+                    style={{ width: `${clampScore(t.score)}%` }}
+                  />
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {opened && (
+        <p className="rounded-xl bg-zinc-500/[0.07] px-3 py-2 text-xs leading-relaxed text-zinc-600 dark:text-zinc-400">
+          <span className="font-semibold">{opened.label}: </span>
+          {opened.score == null
+            ? "Not enough of the label was readable to score this. "
+            : ""}
+          {opened.detail}
+        </p>
+      )}
+
+      {overall != null && (
+        <p className="text-center text-xs text-zinc-500">
+          Overall <span className="font-bold tabular-nums">{overall}</span>/100
+          {isFood
+            ? " — safety 35%, nutrition 50%, compliance 15%"
+            : " — safety 75%, compliance 25%"}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** The top-of-results verdict card: big call, one-line reason, three scores. */
 function VerdictCard({ a, save }: { a: ProductAnalysis; save: SaveState }) {
   const m = VERDICT_META[a.verdict] ?? VERDICT_META.caution;
-  const score = a.overall_assessment?.safety_score;
+  const foodWording = verdictDisplay(a);
+  const label = foodWording?.label ?? m.label;
+  const subline = foodWording?.subline ?? VERDICT_SUBLINE[a.verdict];
   return (
     <section className={`flex flex-col gap-3 rounded-2xl border-2 p-5 ${m.card}`}>
       <p className="text-xs font-medium text-zinc-500">
         {a.product_info?.name ?? "Product name not readable"}
         {a.product_info?.brand ? ` · ${a.product_info.brand}` : ""}
       </p>
-      <div className="flex items-center justify-between gap-4">
-        <div className="min-w-0">
-          <p
-            className={`flex items-center gap-2 text-lg font-extrabold leading-tight ${m.text}`}
-          >
-            <m.Icon className="h-5 w-5 shrink-0" aria-hidden />
-            {m.label}
+
+      <ScoreStrip a={a} />
+
+      <div className="min-w-0">
+        <p
+          className={`flex items-center gap-2 text-lg font-extrabold leading-tight ${m.text}`}
+        >
+          <m.Icon className="h-5 w-5 shrink-0" aria-hidden />
+          {label}
+        </p>
+        {a.verdict_reason && (
+          <p className="mt-1.5 text-sm text-zinc-700 dark:text-zinc-300">
+            {a.verdict_reason}
           </p>
-          {a.verdict_reason && (
-            <p className="mt-1.5 text-sm text-zinc-700 dark:text-zinc-300">
-              {a.verdict_reason}
-            </p>
-          )}
-        </div>
-        {typeof score === "number" && (
-          <div className="shrink-0">
-            <SafetyGauge score={score} />
-          </div>
+        )}
+        {subline && (
+          <p className="mt-1 text-xs text-zinc-600 dark:text-zinc-400">
+            {subline}
+          </p>
         )}
       </div>
       <SaveNote save={save} />

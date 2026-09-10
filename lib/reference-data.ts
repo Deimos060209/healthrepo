@@ -10,6 +10,12 @@
  * accurate, sourced, and readable.
  */
 
+import type {
+  NutritionalConcernType,
+  NutritionalConcernLevel,
+  NutrientLevel,
+} from "@/types/analysis";
+
 // ============================================================================
 // TYPES
 // ============================================================================
@@ -2788,6 +2794,16 @@ export interface CompactReference {
   legal_metrology?: { declaration: string; requirement: string }[];
   labelling_rules?: string[];
   household_safety?: { name: string; concern_level: string; safety_note: string }[];
+  /** Food only — names + aliases + penalties, no prose (see NUTRITIONAL_CONCERNS). */
+  nutritional_concerns?: {
+    name: string;
+    also_known_as: string[];
+    concern_type: string;
+    concern_level: string;
+    score_penalty: number;
+  }[];
+  /** Food only — the per-100 g / per-100 ml bands. */
+  nutritional_thresholds?: typeof NUTRITIONAL_THRESHOLDS;
   stricter_thresholds_note?: string;
 }
 
@@ -2875,6 +2891,20 @@ export function buildCompactReference(category: string): CompactReference {
     out.labelling_rules = rule.required_labels;
   }
 
+  if (foodSide) {
+    // Nutritional quality is a food-only dimension. Names + aliases + the
+    // concern type/level/penalty are all the model needs to IDENTIFY a
+    // concern; the prose is re-attached locally by lib/enrich-analysis.ts.
+    out.nutritional_concerns = NUTRITIONAL_CONCERNS.map((n) => ({
+      name: n.name,
+      also_known_as: n.also_known_as,
+      concern_type: n.concern_type,
+      concern_level: n.concern_level,
+      score_penalty: n.score_penalty,
+    }));
+    out.nutritional_thresholds = NUTRITIONAL_THRESHOLDS;
+  }
+
   if (baby) {
     out.stricter_thresholds_note =
       "BABY PRODUCT — zero tolerance. Flag ANY artificial colour, artificial sweetener or harmful preservative as at least 'harmful' (or 'banned' if it is on a banned list). Flag ANY ingredient with even a 'low' concern level as 'caution'. Apply the stricter of the Indian and EU limits from your own knowledge.";
@@ -2882,4 +2912,843 @@ export function buildCompactReference(category: string): CompactReference {
 
   return out;
 }
+
+// ===========================================================================
+// NUTRITIONAL QUALITY — the second dimension
+// ===========================================================================
+//
+// Everything above this line is about SAFETY: banned substances, harmful
+// additives, FSSAI limits. A product can pass all of it and still be a poor
+// food — refined flour, three kinds of sugar and palm oil are all perfectly
+// legal and additive-free, and would score 96/100 on safety alone.
+//
+// NUTRITIONAL_CONCERNS and NUTRITIONAL_THRESHOLDS drive a separate
+// nutrition_score (25-100). The scoring itself lives in lib/enrich-analysis.ts
+// so that the model IDENTIFIES ingredients and our code does the ARITHMETIC.
+//
+// Tone rule for every string below: factual, never alarmist. A refined-grain
+// product is not dangerous, it is a less nutritious choice — say that plainly
+// and name something better.
+
+export interface NutritionalConcernEntry {
+  name: string;
+  /** Label spellings a manufacturer might use. Matched case-insensitively. */
+  also_known_as: string[];
+  concern_type: NutritionalConcernType;
+  concern_level: NutritionalConcernLevel;
+  /**
+   * Points off nutrition_score, applied under the double-counting rules in
+   * lib/enrich-analysis.ts — a threshold penalty and an ingredient penalty
+   * must never both charge for the same problem.
+   */
+  score_penalty: number;
+  why_flagged: string;
+  health_effects: string;
+  moderation_guidance: string;
+  who_should_limit: string[];
+  better_alternative: string;
+}
+
+export const NUTRITIONAL_CONCERNS: NutritionalConcernEntry[] = [
+  // -------------------------------------------------------------------------
+  // REFINED GRAINS — deliberately ranked. These are NOT equivalent: maida is
+  // stripped bare; semolina is coarser and keeps more of the grain.
+  // -------------------------------------------------------------------------
+  {
+    name: "Maida",
+    also_known_as: [
+      "Refined Wheat Flour",
+      "Refined Flour",
+      "All Purpose Flour",
+      "All-Purpose Flour",
+      "Wheat Flour (Refined)",
+      "White Flour",
+      "Plain Flour",
+    ],
+    concern_type: "refined_grain",
+    concern_level: "significant",
+    score_penalty: 18,
+    why_flagged:
+      "Maida is wheat stripped of its bran and germ, removing nearly all fibre, B vitamins, iron and healthy fats. What remains is mostly starch.",
+    health_effects:
+      "Digests very quickly and spikes blood sugar (high glycemic index). Regular consumption is linked to insulin resistance, weight gain around the abdomen, and higher risk of type 2 diabetes. The near-total absence of fibre means it does not keep you full, leading to overeating, and it slows digestion causing constipation.",
+    moderation_guidance:
+      "Fine occasionally. As a daily staple it displaces more nutritious grains — aim for no more than a few servings a week.",
+    who_should_limit: [
+      "Diabetic",
+      "Pre-diabetic",
+      "Weight management",
+      "Heart condition",
+    ],
+    better_alternative:
+      "Whole wheat atta, multigrain flour, millet flours (ragi, bajra, jowar)",
+  },
+  {
+    name: "Durum Wheat Semolina",
+    also_known_as: [
+      "Semolina",
+      "Sooji",
+      "Suji",
+      "Rava",
+      "Durum Wheat",
+      "Durum Semolina",
+      "Durum Wheat Semolina (Sooji)",
+    ],
+    concern_type: "refined_grain",
+    concern_level: "moderate",
+    score_penalty: 12,
+    why_flagged:
+      "Semolina is a refined grain, but a coarser and less processed one than maida. It retains more protein and has a lower glycemic index, though the bran and germ are still largely removed.",
+    health_effects:
+      "Raises blood sugar more slowly than maida but still faster than whole grains. Fibre content is low, so it is less filling than whole wheat. Contains gluten.",
+    moderation_guidance:
+      "Reasonable in moderation and better than maida-based products, but whole grain versions remain the healthier everyday choice.",
+    who_should_limit: ["Diabetic", "Gluten", "Wheat"],
+    better_alternative: "Whole wheat pasta, millet pasta, buckwheat noodles",
+  },
+  {
+    name: "White Rice",
+    also_known_as: [
+      "Polished Rice",
+      "Refined Rice",
+      "Milled Rice",
+      "Rice (Polished)",
+      "Rice Flour",
+      "Refined Rice Flour",
+      "White Rice Flour",
+    ],
+    concern_type: "refined_grain",
+    concern_level: "moderate",
+    score_penalty: 12,
+    why_flagged:
+      "Polishing removes the bran and germ from the rice grain, taking most of the fibre, magnesium and B vitamins with them and leaving mainly starch.",
+    health_effects:
+      "Has a high glycemic index, so it raises blood sugar quickly and is less filling than unpolished rice. Large regular portions are associated with higher risk of type 2 diabetes in South Asian populations specifically.",
+    moderation_guidance:
+      "A normal part of an Indian diet — the issue is portion size and eating it with nothing alongside. Pair it with dal, vegetables or curd, or swap some meals for an unpolished grain.",
+    who_should_limit: ["Diabetic", "Pre-diabetic", "Weight management"],
+    better_alternative: "Brown rice, hand-pounded rice, millets, quinoa",
+  },
+  {
+    name: "Corn Starch",
+    also_known_as: [
+      "Cornstarch",
+      "Corn Flour",
+      "Maize Starch",
+      "Modified Starch",
+      "Modified Corn Starch",
+      "Modified Food Starch",
+      "Tapioca Starch",
+      "Potato Starch",
+    ],
+    concern_type: "refined_grain",
+    concern_level: "moderate",
+    score_penalty: 10,
+    why_flagged:
+      "Pure starch extracted from the grain with the protein, fibre and micronutrients removed. It is used for texture and bulk and contributes calories with essentially no nutrition of its own.",
+    health_effects:
+      "Digests rapidly and raises blood sugar. In small amounts as a thickener this is unimportant; high in the ingredients order it means a large share of the product is refined starch.",
+    moderation_guidance:
+      "Not a concern as a minor thickener. Worth noting when it appears in the first few ingredients, which means the product is mostly starch.",
+    who_should_limit: ["Diabetic", "Pre-diabetic"],
+    better_alternative:
+      "Products thickened with whole grain flour, oats, or nothing at all",
+  },
+  {
+    name: "White Bread",
+    also_known_as: [
+      "Refined Flour Bread",
+      "Maida Bread",
+      "White Pav",
+      "Milk Bread",
+      "Sandwich Bread (White)",
+    ],
+    concern_type: "refined_grain",
+    concern_level: "significant",
+    score_penalty: 16,
+    why_flagged:
+      "White bread is made almost entirely from refined flour, usually with added sugar and salt, and has had the fibre-bearing parts of the wheat removed before baking.",
+    health_effects:
+      "Digests quickly and raises blood sugar sharply for a food eaten in large daily quantities. Low fibre means poor satiety, and it commonly carries more sodium than people expect.",
+    moderation_guidance:
+      "Fine occasionally. If bread is a daily food, a whole-grain loaf is a meaningfully better everyday choice.",
+    who_should_limit: [
+      "Diabetic",
+      "Pre-diabetic",
+      "Weight management",
+      "Hypertension (high BP)",
+    ],
+    better_alternative:
+      "100% whole wheat bread, multigrain bread with visible grains, whole wheat sourdough",
+  },
+
+  // -------------------------------------------------------------------------
+  // ADDED SUGARS — every alias, because manufacturers split sugar across
+  // several names so no single one appears high in the ingredients order.
+  // -------------------------------------------------------------------------
+  {
+    name: "Sugar",
+    also_known_as: [
+      "Sucrose",
+      "Cane Sugar",
+      "Refined Sugar",
+      "White Sugar",
+      "Brown Sugar",
+      "Caster Sugar",
+      "Demerara Sugar",
+      "Icing Sugar",
+      "Added Sugar",
+    ],
+    concern_type: "added_sugar",
+    concern_level: "significant",
+    // Charged only when no nutrition panel was visible. When the per-100 sugar
+    // threshold fires at 'high' this penalty is suppressed (STEP 3 rule).
+    score_penalty: 12,
+    why_flagged:
+      "Sugar added during manufacture contributes calories with no vitamins, minerals or fibre. The WHO recommends keeping free sugars under 10% of daily energy, and ideally under 5%.",
+    health_effects:
+      "Raises blood glucose quickly, promotes weight gain when it displaces more filling foods, and is the single largest dietary contributor to tooth decay. Sustained high intake is associated with fatty liver, raised triglycerides and higher type 2 diabetes risk.",
+    moderation_guidance:
+      "Sugar is not poison and an occasional sweet food is fine. The problem is cumulative daily intake from products that do not taste sweet — sauces, breads, breakfast cereals, biscuits.",
+    who_should_limit: [
+      "Diabetic",
+      "Pre-diabetic",
+      "Weight management",
+      "Child under 12",
+    ],
+    better_alternative:
+      "Unsweetened versions, whole fruit for sweetness, products listing under 5 g sugar per 100 g",
+  },
+  {
+    name: "High Fructose Corn Syrup",
+    also_known_as: [
+      "HFCS",
+      "Corn Syrup",
+      "Glucose-Fructose Syrup",
+      "Fructose-Glucose Syrup",
+      "High Maltose Corn Syrup",
+      "Isoglucose",
+    ],
+    concern_type: "added_sugar",
+    concern_level: "significant",
+    score_penalty: 15,
+    why_flagged:
+      "A cheap liquid sweetener with a high free-fructose content, used in place of sugar because it costs less and mixes easily into drinks and sauces.",
+    health_effects:
+      "Free fructose is processed almost entirely by the liver. High regular intake is associated with non-alcoholic fatty liver disease, raised blood triglycerides, insulin resistance and abdominal weight gain. Because it is liquid it does not trigger fullness the way solid food does, so the calories add on top of what you already ate.",
+    moderation_guidance:
+      "Worth avoiding as a routine ingredient. Its presence usually signals a heavily sweetened processed product.",
+    who_should_limit: [
+      "Diabetic",
+      "Pre-diabetic",
+      "Weight management",
+      "Heart condition",
+      "Child under 12",
+    ],
+    better_alternative:
+      "Products sweetened with whole fruit or nothing at all; plain water or unsweetened drinks",
+  },
+  {
+    name: "Invert Sugar",
+    also_known_as: [
+      "Invert Syrup",
+      "Liquid Glucose",
+      "Glucose Syrup",
+      "Dextrose",
+      "Dextrose Monohydrate",
+      "Maltodextrin",
+      "Maltose",
+      "Golden Syrup",
+    ],
+    concern_type: "added_sugar",
+    concern_level: "moderate",
+    score_penalty: 8,
+    why_flagged:
+      "These are all manufactured sugars used for sweetness, bulk and texture. Maltodextrin in particular is not sweet, so it is easy to miss, but it raises blood glucose faster than table sugar does.",
+    health_effects:
+      "Digest and absorb rapidly, producing a quick blood-sugar rise with no fibre, protein or micronutrients alongside. They add to the product's total sugar load even when 'sugar' itself appears far down the list.",
+    moderation_guidance:
+      "Individually minor. Their real significance is as a signal — when two or three appear together, the product carries far more added sugar than its ingredients order suggests.",
+    who_should_limit: ["Diabetic", "Pre-diabetic", "Weight management"],
+    better_alternative:
+      "Products with a short ingredients list and a single named sweetener, or none",
+  },
+  {
+    name: "Fructose",
+    also_known_as: ["Crystalline Fructose", "Added Fructose"],
+    concern_type: "added_sugar",
+    concern_level: "moderate",
+    score_penalty: 8,
+    why_flagged:
+      "Added fructose is not the same as the fructose in whole fruit, which arrives with fibre, water and micronutrients that slow its absorption.",
+    health_effects:
+      "Metabolised chiefly in the liver. Regular high intake in isolated form is linked to raised triglycerides and fat accumulation in the liver. It does not raise blood glucose as sharply as glucose, which is why it is marketed as diabetic-friendly — that does not make it a health food.",
+    moderation_guidance:
+      "Treat it as sugar by another name. Whole fruit is a completely different proposition and needs no limiting.",
+    who_should_limit: ["Weight management", "Heart condition", "Diabetic"],
+    better_alternative: "Whole fruit, unsweetened products",
+  },
+  {
+    name: "Glucose Syrup Solids",
+    also_known_as: [
+      "Dried Glucose Syrup",
+      "Corn Syrup Solids",
+      "Glucose Solids",
+    ],
+    concern_type: "added_sugar",
+    concern_level: "moderate",
+    score_penalty: 8,
+    why_flagged:
+      "Dehydrated glucose syrup used as a bulking sweetener in powders, drink mixes and confectionery. It is sugar in a form that pours like flour.",
+    health_effects:
+      "Absorbs quickly and raises blood glucose. Adds calories and sweetness with no accompanying nutrition.",
+    moderation_guidance:
+      "Occasional intake is unimportant; watch for it in products consumed daily, such as beverage powders and health drinks.",
+    who_should_limit: ["Diabetic", "Pre-diabetic", "Weight management"],
+    better_alternative: "Unsweetened powders, plain milk, plain water",
+  },
+  {
+    name: "Honey",
+    also_known_as: ["Honey Powder", "Honey Solids"],
+    concern_type: "added_sugar",
+    concern_level: "mild",
+    score_penalty: 4,
+    why_flagged:
+      "Honey added to a processed food counts as an added sugar. It carries traces of antioxidants and enzymes, but nutritionally it behaves much like table sugar.",
+    health_effects:
+      "Raises blood glucose similarly to sugar. The trace nutrients are present in quantities too small to offset the sugar load at the amounts used in manufacturing.",
+    moderation_guidance:
+      "A genuinely small advantage over refined sugar, and no reason on its own to avoid a product — but it still counts towards your daily free-sugar intake.",
+    who_should_limit: ["Diabetic", "Pre-diabetic", "Child under 5"],
+    better_alternative: "Unsweetened products, whole fruit",
+  },
+  {
+    name: "Jaggery",
+    also_known_as: ["Gur", "Jaggery Powder", "Palm Jaggery", "Cane Jaggery"],
+    concern_type: "added_sugar",
+    concern_level: "mild",
+    score_penalty: 4,
+    why_flagged:
+      "Jaggery is less refined than white sugar and retains small amounts of iron and minerals, but as an added sweetener it is still concentrated sugar.",
+    health_effects:
+      "Raises blood glucose much like sugar does. The mineral content is real but modest — you would have to eat an unhealthy quantity for it to matter nutritionally.",
+    moderation_guidance:
+      "A reasonable traditional choice over refined sugar. It is not a free pass; the amount still counts.",
+    who_should_limit: ["Diabetic", "Pre-diabetic"],
+    better_alternative:
+      "Unsweetened products, or the same product with less of it",
+  },
+  {
+    name: "Molasses",
+    also_known_as: ["Treacle", "Blackstrap Molasses", "Cane Molasses"],
+    concern_type: "added_sugar",
+    concern_level: "mild",
+    score_penalty: 4,
+    why_flagged:
+      "A by-product of sugar refining used for colour and a deep sweetness. It keeps some iron, calcium and potassium, but remains an added sugar.",
+    health_effects:
+      "Contributes to total free-sugar intake and raises blood glucose. Its mineral content is the highest of any sugar syrup, though still small in the amounts actually used.",
+    moderation_guidance:
+      "Nutritionally the least objectionable of the sugar syrups — count it as sugar all the same.",
+    who_should_limit: ["Diabetic", "Pre-diabetic"],
+    better_alternative: "Unsweetened products",
+  },
+  {
+    name: "Malt Extract",
+    also_known_as: [
+      "Barley Malt Extract",
+      "Malt Syrup",
+      "Malted Barley Extract",
+      "Liquid Malt",
+    ],
+    concern_type: "added_sugar",
+    concern_level: "moderate",
+    score_penalty: 6,
+    why_flagged:
+      "Malt extract is largely maltose — a sugar — used for sweetness, colour and flavour. It reads like a grain ingredient but functions as a sweetener.",
+    health_effects:
+      "Raises blood glucose quickly; maltose has a glycemic index higher than table sugar. It contributes meaningfully to the sugar total in breakfast cereals and malted drinks.",
+    moderation_guidance:
+      "Worth recognising as sugar when judging a product marketed on its grain or malt content.",
+    who_should_limit: [
+      "Diabetic",
+      "Pre-diabetic",
+      "Gluten",
+      "Weight management",
+    ],
+    better_alternative: "Unsweetened cereals and drinks, plain milk",
+  },
+  {
+    name: "Rice Syrup",
+    also_known_as: ["Brown Rice Syrup", "Rice Malt Syrup"],
+    concern_type: "added_sugar",
+    concern_level: "moderate",
+    score_penalty: 8,
+    why_flagged:
+      "Marketed as a natural sweetener, but it is almost entirely glucose and has one of the highest glycemic indices of any sweetener in common use.",
+    health_effects:
+      "Raises blood glucose faster than table sugar. Carries no meaningful fibre, vitamins or minerals despite the wholefood positioning.",
+    moderation_guidance:
+      "Treat it exactly as you would sugar; the 'brown rice' name does not change what it does.",
+    who_should_limit: ["Diabetic", "Pre-diabetic", "Weight management"],
+    better_alternative: "Unsweetened products, whole fruit",
+  },
+  {
+    name: "Agave Syrup",
+    also_known_as: ["Agave Nectar", "Agave Sweetener"],
+    concern_type: "added_sugar",
+    concern_level: "moderate",
+    score_penalty: 8,
+    why_flagged:
+      "Agave syrup is roughly 80% fructose — a higher share than high fructose corn syrup — despite being sold as a healthy alternative to sugar.",
+    health_effects:
+      "The low glycemic index it is marketed on comes from that fructose load, which is handled by the liver rather than raising blood glucose. Regular high intake is linked to raised triglycerides and liver fat.",
+    moderation_guidance:
+      "No advantage over sugar for most people, and a disadvantage for anyone watching their liver or triglycerides.",
+    who_should_limit: ["Weight management", "Heart condition", "Diabetic"],
+    better_alternative: "Whole fruit, unsweetened products",
+  },
+  {
+    name: "Fruit Juice Concentrate",
+    also_known_as: [
+      "Concentrated Fruit Juice",
+      "Apple Juice Concentrate",
+      "Grape Juice Concentrate",
+      "Pear Juice Concentrate",
+      "Deionised Fruit Juice",
+    ],
+    concern_type: "added_sugar",
+    concern_level: "moderate",
+    score_penalty: 7,
+    why_flagged:
+      "Fruit juice with the water — and usually the fibre and much of the flavour — removed, leaving concentrated sugar that can be declared as fruit rather than as sugar.",
+    health_effects:
+      "Nutritionally close to added sugar. Without the fibre of whole fruit it is absorbed quickly and does little to fill you up, so it adds sugar to the product while making the label read as fruit-based.",
+    moderation_guidance:
+      "A common way to sweeten a product while marketing it as having 'no added sugar'. Judge it by the total sugar figure on the panel, not by the ingredient name.",
+    who_should_limit: ["Diabetic", "Pre-diabetic", "Child under 12"],
+    better_alternative: "Whole fruit, unsweetened products",
+  },
+
+  // -------------------------------------------------------------------------
+  // REFINED AND PROCESSED OILS
+  // -------------------------------------------------------------------------
+  {
+    name: "Palm Oil",
+    also_known_as: [
+      "Palmolein",
+      "Palmolein Oil",
+      "Refined Palmolein",
+      "Palm Kernel Oil",
+      "Palm Fat",
+      "Vegetable Fat (Palm)",
+    ],
+    concern_type: "refined_oil",
+    concern_level: "moderate",
+    score_penalty: 8,
+    why_flagged:
+      "Palm oil is about half saturated fat, which is unusually high for a plant oil. It is used because it is cheap, stable at high temperatures and solid at room temperature.",
+    health_effects:
+      "Raises LDL, the cholesterol fraction associated with arterial plaque. Regularly replacing unsaturated cooking oils with palm oil is associated with a less favourable blood lipid profile and higher cardiovascular risk.",
+    moderation_guidance:
+      "Common in Indian packaged snacks and bakery products, so it accumulates quickly across a day. Worth limiting rather than eliminating.",
+    who_should_limit: [
+      "Heart condition",
+      "Hypertension (high BP)",
+      "Weight management",
+      "No palm oil",
+    ],
+    better_alternative:
+      "Groundnut oil, mustard oil, rice bran oil, sunflower oil, cold-pressed oils",
+  },
+  {
+    name: "Refined Vegetable Oil",
+    also_known_as: [
+      "Vegetable Oil",
+      "Edible Vegetable Oil",
+      "Refined Oil",
+      "Vegetable Fat",
+      "Refined Edible Oil",
+    ],
+    concern_type: "refined_oil",
+    concern_level: "moderate",
+    score_penalty: 6,
+    why_flagged:
+      "The source is not disclosed, so you cannot tell whether it is a reasonable oil or palm oil. It has also been bleached and deodorised, which strips the vitamin E and plant compounds a cold-pressed oil retains.",
+    health_effects:
+      "The effect depends entirely on the undisclosed source. Refining itself removes most of the antioxidants and, at industrial temperatures, generates small amounts of oxidised fats.",
+    moderation_guidance:
+      "The lack of disclosure is itself the issue — a manufacturer using a good oil usually names it. Prefer products that say which oil they used.",
+    who_should_limit: ["Heart condition", "No palm oil"],
+    better_alternative:
+      "Products naming a single oil — cold-pressed groundnut, mustard, sesame or rice bran",
+  },
+  {
+    name: "Hydrogenated Vegetable Oil",
+    also_known_as: [
+      "Partially Hydrogenated Oil",
+      "Partially Hydrogenated Vegetable Oil",
+      "Hydrogenated Fat",
+      "Vanaspati",
+      "Bakery Shortening",
+      "Hydrogenated Margarine",
+    ],
+    concern_type: "trans_fat",
+    concern_level: "significant",
+    score_penalty: 15,
+    why_flagged:
+      "Partial hydrogenation creates industrial trans fat. There is no safe level of it — the WHO has called for its complete elimination from the food supply, and FSSAI caps it at 2% of total fat.",
+    health_effects:
+      "Raises LDL cholesterol and simultaneously lowers HDL, a combination no other dietary fat produces. Strongly linked to coronary heart disease, and associated with systemic inflammation and insulin resistance.",
+    moderation_guidance:
+      "This is the one nutritional ingredient genuinely worth avoiding outright rather than moderating.",
+    who_should_limit: [
+      "Heart condition",
+      "Hypertension (high BP)",
+      "Diabetic",
+      "No trans fat",
+      "Pregnant",
+      "Child under 12",
+    ],
+    better_alternative:
+      "Products using non-hydrogenated oils, ghee in moderation, cold-pressed oils",
+  },
+  {
+    name: "Interesterified Fat",
+    also_known_as: [
+      "Interesterified Vegetable Fat",
+      "Interesterified Oil",
+      "Rearranged Fat",
+    ],
+    concern_type: "refined_oil",
+    concern_level: "moderate",
+    score_penalty: 8,
+    why_flagged:
+      "The industry's replacement for partially hydrogenated fat. It contains no trans fat, which is a real improvement, but achieves solidity by rearranging saturated fatty acids instead.",
+    health_effects:
+      "Clearly better than trans fat. The long-term evidence is thinner than for other fats, and some studies suggest effects on blood glucose and HDL, so it is not a neutral ingredient.",
+    moderation_guidance:
+      "An improvement on what it replaced. Still an industrially modified fat, used in products that tend to be high in fat overall.",
+    who_should_limit: ["Heart condition", "Diabetic"],
+    better_alternative:
+      "Products made with named unmodified oils, or with less fat overall",
+  },
+
+  // -------------------------------------------------------------------------
+  // PROCESSED PROTEIN
+  // -------------------------------------------------------------------------
+  {
+    name: "Processed Meat",
+    also_known_as: [
+      "Salami",
+      "Sausage",
+      "Ham",
+      "Bacon",
+      "Cured Meat",
+      "Pepperoni",
+      "Luncheon Meat",
+      "Smoked Meat",
+      "Corned Beef",
+      "Hot Dog",
+      "Frankfurter",
+      "Chicken Salami",
+      "Chicken Sausage",
+    ],
+    concern_type: "processed_protein",
+    concern_level: "significant",
+    score_penalty: 15,
+    why_flagged:
+      "Meat preserved by smoking, curing, salting or nitrite preservatives. The WHO's cancer agency (IARC) classifies processed meat as a Group 1 carcinogen — the category where the evidence for a causal link in humans is strongest.",
+    health_effects:
+      "Regular consumption is causally associated with colorectal cancer; the IARC estimate is roughly an 18% increase in relative risk per 50 g eaten daily. Processed meat is also high in sodium and saturated fat, which independently affect blood pressure and blood lipids.",
+    moderation_guidance:
+      "Group 1 describes the strength of the evidence, not the size of the risk — an occasional serving is not comparable to smoking. The guidance is to make it occasional rather than routine.",
+    who_should_limit: [
+      "Hypertension (high BP)",
+      "Heart condition",
+      "Kidney condition",
+      "Pregnant",
+      "Child under 12",
+    ],
+    better_alternative:
+      "Fresh unprocessed chicken, fish, eggs, paneer, or legumes",
+  },
+];
+
+// ---------------------------------------------------------------------------
+// NUTRITIONAL_THRESHOLDS — per 100 g (solids) / per 100 ml (beverages)
+// ---------------------------------------------------------------------------
+//
+// Bands follow FSSAI front-of-pack guidance and the WHO / UK FSA traffic-light
+// model, deliberately steepened (2026 recalibration): a product that is extreme
+// in ONE nutrient must not escape almost unpenalised just because ingredient
+// penalties are the only thing that stacks. Each threshold is a list of bands
+// ordered HIGH to LOW — the first band whose `above` the value exceeds wins;
+// a value below every band is 'low' with no penalty.
+
+export interface NutrientBand {
+  /** A value STRICTLY greater than this sits in this band (bands run high→low). */
+  above: number;
+  level: NutrientLevel;
+  /** Points subtracted from nutrition_score when this band is the one that fires. */
+  penalty: number;
+}
+
+export interface NutrientThreshold {
+  /** Display name used in the UI and the PDF. */
+  nutrient: string;
+  unit: "g" | "mg";
+  /** Bands ordered from the most severe (`very_high`) down. */
+  bands: NutrientBand[];
+  /** Plain-language band, shown beside the value. */
+  reference: string;
+}
+
+export interface NutrientBonus {
+  nutrient: string;
+  unit: "g";
+  high_above: number;
+  high_bonus: number;
+  medium_from: number;
+  medium_bonus: number;
+  reference: string;
+}
+
+export const NUTRITIONAL_THRESHOLDS = {
+  /** Sugar in a SOLID food, per 100 g. */
+  sugar_solid: {
+    nutrient: "Sugar",
+    unit: "g",
+    bands: [
+      { above: 40, level: "very_high", penalty: 45 },
+      { above: 22.5, level: "high", penalty: 30 },
+      { above: 5, level: "medium", penalty: 12 },
+    ],
+    reference: "Very high above 40 g, high above 22.5 g, low below 5 g per 100 g",
+  } as NutrientThreshold,
+
+  /** Sugar in a BEVERAGE, per 100 ml. A different scale, not a rescaled one. */
+  sugar_liquid: {
+    nutrient: "Sugar",
+    unit: "g",
+    bands: [
+      { above: 20, level: "very_high", penalty: 45 },
+      { above: 11.25, level: "high", penalty: 35 },
+      { above: 5, level: "medium_high", penalty: 25 },
+      { above: 2.5, level: "medium", penalty: 12 },
+    ],
+    reference:
+      "Very high above 20 g, high above 11.25 g, low below 2.5 g per 100 ml",
+  } as NutrientThreshold,
+
+  /** Sodium per 100 g. 600 mg sodium is 1.5 g salt (salt = sodium x 2.5). */
+  sodium: {
+    nutrient: "Sodium",
+    unit: "mg",
+    bands: [
+      { above: 1200, level: "very_high", penalty: 35 },
+      { above: 600, level: "high", penalty: 25 },
+      { above: 120, level: "medium", penalty: 10 },
+    ],
+    reference:
+      "Very high above 1200 mg, high above 600 mg sodium (1.5 g salt) per 100 g",
+  } as NutrientThreshold,
+
+  saturated_fat: {
+    nutrient: "Saturated fat",
+    unit: "g",
+    bands: [
+      { above: 10, level: "very_high", penalty: 30 },
+      { above: 5, level: "high", penalty: 20 },
+      { above: 1.5, level: "medium", penalty: 8 },
+    ],
+    reference: "Very high above 10 g, high above 5 g per 100 g",
+  } as NutrientThreshold,
+
+  total_fat: {
+    nutrient: "Total fat",
+    unit: "g",
+    bands: [
+      { above: 30, level: "very_high", penalty: 20 },
+      { above: 17.5, level: "high", penalty: 14 },
+      { above: 3, level: "medium", penalty: 6 },
+    ],
+    reference: "Very high above 30 g, high above 17.5 g per 100 g",
+  } as NutrientThreshold,
+
+  /**
+   * Trans fat has a single band — anything above 0.2 g per 100 g is a severe
+   * flag. FSSAI additionally caps it at 2% of total fat; exceeding that is a
+   * COMPLIANCE violation as well as a nutritional one.
+   */
+  trans_fat: {
+    nutrient: "Trans fat",
+    unit: "g",
+    bands: [{ above: 0.2, level: "very_high", penalty: 40 }],
+    reference: "Any amount above 0.2 g per 100 g",
+  } as NutrientThreshold,
+
+  /** FSSAI cap on trans fat as a share of total fat. */
+  trans_fat_share_of_total_fat: 0.02,
+
+  /** The one POSITIVE nutrient — a bonus, not a penalty. */
+  fibre: {
+    nutrient: "Fibre",
+    unit: "g",
+    high_above: 6,
+    high_bonus: 5,
+    medium_from: 3,
+    medium_bonus: 2,
+    reference: "Good above 6 g per 100 g",
+  } as NutrientBonus,
+
+  /** More than 10 ingredients AND at least 3 additives (E-numbers / INS codes). */
+  ultra_processing: {
+    min_ingredients_exclusive: 10,
+    min_additives: 3,
+    penalty: 10,
+    message:
+      "This is an ultra-processed food. Diets high in ultra-processed foods are associated with obesity, cardiovascular disease and type 2 diabetes regardless of individual ingredient safety.",
+  },
+
+  /**
+   * Three or more DISTINCT added-sugar names in one ingredients list. Applies
+   * whether or not the sugar threshold fired.
+   */
+  sugar_alias_rule: {
+    min_distinct_aliases: 3,
+    penalty: 8,
+    message:
+      "This product lists sugar under multiple names, which makes the total sugar content appear lower in the ingredients order than it actually is.",
+  },
+
+  /**
+   * 2026 recalibration — hard ceilings on nutrition_score, applied AFTER the
+   * penalty arithmetic. The LOWEST applicable cap wins. A product that is
+   * extreme in one dimension cannot score well by simply having few other
+   * faults, however generous the arithmetic was.
+   */
+  score_caps: {
+    /** Any nutrient in its 'very_high' band. */
+    any_very_high: 30,
+    /** Any nutrient in its 'high' band. */
+    any_high: 45,
+    /** Two or more nutrients at 'medium' or worse. */
+    two_plus_medium: 60,
+    /** Trans fat above 0.2 g per 100 g anywhere on the panel. */
+    trans_fat_present: 20,
+    /** A beverage whose sugar is 'medium_high' or worse — a sugar-sweetened drink. */
+    beverage_sugar_medium_high: 30,
+    /** 3+ distinct sugar names AND no nutrition panel to check the total against. */
+    sugar_aliases_no_panel: 50,
+  },
+
+  /**
+   * NUTRIENT-DENSITY ceilings. A finished product is scored for what it
+   * positively provides, not merely the absence of faults. Applies ONLY to
+   * food_type 'processed_product' and 'minimally_processed' — never to staple
+   * ingredients, which are cooking inputs, not complete foods. For
+   * 'minimally_processed' each ceiling is raised by `density_cap_minimally_bonus`.
+   *   empty    -> 35   soft drinks, boiled sweets, pure refined-flour snacks
+   *   low      -> 75   refined grains / starches / oils / sugars as the base
+   *   moderate -> 88   some value, but noticeably refined or narrow
+   *   high     -> none  whole grains, legumes, dairy, eggs, produce
+   */
+  density_caps: {
+    empty: 35,
+    low: 75,
+    moderate: 88,
+    high: null,
+  },
+  density_cap_minimally_bonus: 10,
+  /**
+   * The 90+ band is reserved. Only nutrient_density 'high' with no concern at
+   * 'moderate' or above may exceed this; everything else caps here. Applies to
+   * 'processed_product' only.
+   */
+  top_band_reserve: 85,
+  /** No packaged, processed food is nutritionally perfect. */
+  max_nutrition_score: 95,
+
+  /**
+   * STAPLE INGREDIENT scale (2026 food-type restructure). Staples are scored
+   * far more gently: no density cap, no ultra-processing penalty, ingredient
+   * concern penalties halved. A graded refinement deduction (derived from
+   * nutrient_density, since density is still computed for staples even though
+   * it is not a ceiling) is what separates whole-grain staples from refined
+   * ones. Protein / whole-grain bonuses are suppressed when the primary
+   * ingredient is itself a refined grain.
+   */
+  staple_refinement_penalty: { high: 0, moderate: 6, low: 22, empty: 22 },
+  /** A plain cooking ingredient is a building block, never a "bad product". */
+  staple_floor: 60,
+  /** Total staple penalty is capped here before the floor is applied. */
+  staple_penalty_cap: 70,
+  /**
+   * EXCEPTION: pure sugar, pure refined oil and salt sold as standalone
+   * staples are calorically empty or extreme — they get this flat score and
+   * the "use sparingly" note, not the 60 floor.
+   */
+  staple_extreme_score: 40,
+
+  /**
+   * nutrition_score = 100 - min(penalties, max_total_penalty) + bonuses.
+   * `score_floor_soft` holds first — a product whose only issue is moderate
+   * never drops below it from arithmetic alone. The score_caps above may then
+   * push under it, and only `score_floor` (the hard floor) is applied last.
+   */
+  max_total_penalty: 75,
+  score_floor_soft: 25,
+  score_floor: 10,
+
+  /**
+   * baby_product_food: halve every sugar, sodium and saturated-fat threshold,
+   * and treat ANY added sugar as 'significant' regardless of amount.
+   */
+  baby_threshold_multiplier: 0.5,
+} as const;
+
+// ---------------------------------------------------------------------------
+// NUTRITIONAL_POSITIVES — what a food actively contributes
+// ---------------------------------------------------------------------------
+//
+// The scoring model used to only ever SUBTRACT: a food stayed high only by
+// having no faults. This block lets genuine nutrition lift a score. Bonuses
+// are summed, capped at `max_total`, and applied AFTER penalties and BEFORE
+// the density / score caps, so they can lift a decent food but never mask a
+// real problem. The three "absence" bonuses (no_added_sugar, no_added_salt,
+// minimal_ingredients) are skipped for staple ingredients, where they are
+// trivially true and would flatten the scale.
+
+export const NUTRITIONAL_POSITIVES = {
+  /** Fibre per 100 g, highest matching band wins. */
+  fibre_g: [
+    { above: 10, bonus: 12 },
+    { above: 6, bonus: 8 },
+    { above: 3, bonus: 4 },
+  ],
+  /** Protein per 100 g, highest matching band wins. */
+  protein_g: [
+    { above: 20, bonus: 10 },
+    { above: 10, bonus: 6 },
+    { above: 5, bonus: 3 },
+  ],
+  /** A whole grain is one of the first three ingredients. */
+  whole_grain_primary: 12,
+  /** A pulse / legume is one of the first three ingredients. */
+  legume_primary: 12,
+  /** Nuts or seeds are one of the first three ingredients. */
+  nuts_seeds_primary: 8,
+  /** Plain fermented dairy (curd / yoghurt) with no added sugar. */
+  plain_fermented_dairy: 10,
+  /** A micronutrient-dense ingredient present (leafy greens, millets, moringa). */
+  micronutrient_dense: 6,
+  /** No added sugar anywhere in the ingredients. */
+  no_added_sugar: 5,
+  /** No added salt / sodium beyond trace. */
+  no_added_salt: 3,
+  /** One or two ingredients and no additives. */
+  minimal_ingredients: 5,
+  max_total: 30,
+} as const;
 

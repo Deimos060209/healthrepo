@@ -53,7 +53,8 @@ async function sonnet(cat: string, text: string) {
     `Consumer complaint portal: ${rule.complaint_portal}`, "", `Set detected_category.category to "${cat}".`, "",
     "===== COMPACT REFERENCE DATA =====", JSON.stringify(compact)].join("\n");
   const m = await client.messages.stream({
-    model: "claude-sonnet-5", max_tokens: 4000, thinking: { type: "disabled" },
+    // Keep in step with MAX_OUTPUT_TOKENS in app/api/analyze/route.ts.
+    model: "claude-sonnet-5", max_tokens: 7000, thinking: { type: "disabled" },
     system: [{ type: "text", text: STATIC_SYSTEM, cache_control: { type: "ephemeral" } },
              { type: "text", text: block, cache_control: { type: "ephemeral" } }],
     messages: [{ role: "user", content: `Text extracted from a packaged product via OCR follows.\n\n${text}` }],

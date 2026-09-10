@@ -122,6 +122,60 @@ function build(
       limit_checks: [{ name: LONG, fssai_limit: LONG, declared_quantity_if_available: LONG, status: "exceeds_limit", note: LONG }],
       cumulative_risk: "high", daily_intake_warning: LONG, combination_warnings: [LONG, LONG],
     },
+    // Food only — mirrors the route, which omits the key for non-food.
+    nutritional_analysis: category.startsWith("food") || category.startsWith("baby_product_food")
+      ? {
+          nutrition_score: 31,
+          nutrition_data_complete: false,
+          food_type: "processed_product",
+          food_type_reason: `Food type reason stress string ${LONG}`,
+          nutrient_density: "low",
+          density_note: `Density note stress string ${LONG}`,
+          primary_concern: {
+            nutrient_or_ingredient: "Sugar",
+            level: "high",
+            penalty: 30,
+            explanation: `Primary concern stress string ${LONG}`,
+          },
+          concerns: [
+            {
+              ingredient: LONG,
+              concern_type: "refined_grain",
+              concern_level: "significant",
+              why_flagged: LONG,
+              health_effects: `${LONG} ${LONG}`,
+              moderation_guidance: LONG,
+              who_should_limit: ["Diabetic ".repeat(12), "Weight management"],
+              better_alternative: LONG,
+              score_penalty: 12,
+              source: "reference_database",
+            },
+            {
+              ingredient: "Sugar",
+              concern_type: "added_sugar",
+              concern_level: "moderate",
+              why_flagged: LONG,
+              health_effects: LONG,
+              moderation_guidance: LONG,
+              who_should_limit: [],
+              better_alternative: LONG,
+              score_penalty: 8,
+              source: "ai_knowledge",
+            },
+          ],
+          threshold_flags: [
+            { nutrient: "Sugar", value_per_100: 68, unit: "g", level: "high", penalty: 15, reference: LONG },
+            { nutrient: "Fibre", value_per_100: 9, unit: "g", level: "high", penalty: -5, reference: LONG },
+          ],
+          positive_notes: [LONG, LONG],
+          sugar_alias_count: 4,
+          sugar_aliases_found: ["Sugar", "Invert Sugar", "Liquid Glucose", "Dextrose"],
+          is_ultra_processed: true,
+          ingredient_order_note: LONG,
+          moderation_advice: `${LONG} ${LONG}`,
+          nutritional_concerns_not_in_database: ["Sugar"],
+        }
+      : null,
     personal_alerts: [{ reason: LONG, severity: "critical", ingredient: LONG }],
     overall_assessment: {
       safety_score: 42, compliance_score: 30, safety_status: "ok",
@@ -188,6 +242,23 @@ async function main() {
     check("category-appropriate risk wording", riskRe.test(txt), (txt.match(riskRe) ?? ["none"])[0]);
     check("correct regulator printed", txt.includes(a.detected_category.regulatory_body.slice(0, 18)));
     check("personal health flags present", /CRITICAL/.test(txt));
+
+    // STEP 9 — the nutrition section exists for food and NOT for personal care.
+    if (label === "FOOD") {
+      check("nutritional quality section rendered", /NUTRITIONAL QUALITY/i.test(txt));
+      check("nutrition score printed", /31\/100/.test(txt));
+      check("ultra-processed banner", /Ultra-processed food/i.test(txt));
+      check("sugar alias callout", /listed under 4 different names/i.test(txt));
+      check("threshold reading printed", /Sugar[\s\S]{0,60}68 g/.test(txt), (txt.match(/Sugar[\s\S]{0,40}68 g/) ?? ["none"])[0].replace(/\n/g, " "));
+      check("panel-not-visible note", /Nutrition panel not visible/i.test(txt));
+      check("concern explanation printed", /How much is fine/i.test(txt));
+      check("better alternative printed", /Better alternative/i.test(txt));
+      check("three scores in the overall block", /Nutrition score/.test(txt) && /Safety score/.test(txt) && /Compliance score/.test(txt));
+    } else {
+      check("NO nutrition section for personal care", !/NUTRITIONAL QUALITY/i.test(txt));
+      check("no nutrition score bar for personal care", !/Nutrition score/i.test(txt));
+    }
+
     geometry(shown, label);
   }
 

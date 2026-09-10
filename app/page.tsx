@@ -87,8 +87,8 @@ export default async function Home() {
             Your Health. Your Right. Your Repo.
           </p>
           <p className="mt-1 text-sm text-zinc-600 dark:text-zinc-400">
-            Scan any packaged product to check if it&rsquo;s safe and legally
-            compliant.
+            Scan any packaged product to identify compliance issues and
+            understand ingredients information.
           </p>
           <div className="mt-4 flex flex-wrap justify-center gap-1.5 text-[11px] font-medium text-zinc-600 dark:text-zinc-400">
             {["FSSAI compliance", "Legal Metrology", "Ingredient safety"].map(
