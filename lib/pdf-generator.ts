@@ -343,7 +343,11 @@ function complianceVerdict(a: ProductAnalysis): {
   );
   if (items.length === 0)
     return { key: "unknown", text: "COMPLIANCE NOT ASSESSED", color: MUTED };
-  const pass = items.filter((v) => v.present && v.compliant).length;
+  // "ok_inferred" (e.g. country of origin resolved from an Indian address) is a
+  // pass — compliant, just not explicitly declared.
+  const pass = items.filter(
+    (v) => (v.present && v.compliant) || v.status === "ok_inferred",
+  ).length;
   if (pass === items.length)
     return { key: "compliant", text: "COMPLIANT", color: GREEN };
   if (pass === 0)
@@ -856,20 +860,25 @@ function drawCompliance(R: Layout, a: ProductAnalysis) {
   } else {
     const rows: Cell[][] = entries.map(([key, item]) => {
       const notVisible = item.status === "not_visible";
+      const okInferred = item.status === "ok_inferred";
       const s = isNotApplicable(item)
         ? { label: "N/A", color: MUTED, tint: TINT_ZINC }
         : notVisible
           ? { label: "NOT VISIBLE", color: MUTED, tint: TINT_ZINC }
-          : item.present && item.compliant
-            ? { label: "OK", color: GREEN, tint: TINT_GREEN }
-            : item.present
-              ? { label: "ISSUE", color: AMBER, tint: TINT_AMBER }
-              : { label: "MISSING", color: RED, tint: TINT_RED };
+          : okInferred
+            ? { label: "OK (INFERRED)", color: GREEN, tint: TINT_GREEN }
+            : item.present && item.compliant
+              ? { label: "OK", color: GREEN, tint: TINT_GREEN }
+              : item.present
+                ? { label: "ISSUE", color: AMBER, tint: TINT_AMBER }
+                : { label: "MISSING", color: RED, tint: TINT_RED };
       const issueText = isNotApplicable(item)
         ? "Not applicable"
         : notVisible
           ? "This part of the label was not captured"
-          : fmt(item.issue);
+          : okInferred
+            ? fmt(item.note ?? item.issue)
+            : fmt(item.issue);
       return [
         { text: declLabel(key), bold: true },
         {
@@ -882,7 +891,9 @@ function drawCompliance(R: Layout, a: ProductAnalysis) {
         {
           text: issueText,
           textColor:
-            item.issue && !isNotApplicable(item) && !notVisible ? AMBER : INK,
+            item.issue && !isNotApplicable(item) && !notVisible && !okInferred
+              ? AMBER
+              : INK,
         },
       ];
     });

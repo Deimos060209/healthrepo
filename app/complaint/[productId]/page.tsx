@@ -84,7 +84,17 @@ function computeViolations(
   details: Record<string, ComplianceItem> | null | undefined,
 ): Violation[] {
   return Object.entries(details ?? {})
-    .filter(([, v]) => v && !isNotApplicable(v) && !(v.present && v.compliant))
+    .filter(
+      ([, v]) =>
+        v &&
+        !isNotApplicable(v) &&
+        !(v.present && v.compliant) &&
+        // "ok_inferred" is compliant (e.g. country of origin from an Indian
+        // address); "not_visible" was simply off-frame — neither is a
+        // Legal Metrology violation to put in a complaint letter.
+        v.status !== "ok_inferred" &&
+        v.status !== "not_visible",
+    )
     .map(([k, v]) => ({
       key: k,
       label: declLabel(k),

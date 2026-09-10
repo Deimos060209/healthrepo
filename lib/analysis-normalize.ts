@@ -83,6 +83,7 @@ const scoreOrNull = (v: unknown): number | null => {
 
 const COMPLIANCE_ITEM_STATUSES: readonly string[] = [
   "present",
+  "ok_inferred",
   "missing",
   "not_visible",
   "not_applicable",
@@ -101,7 +102,11 @@ const complianceItemStatus = (
   if (s.includes("not_visible") || s.includes("unclear") || s.includes("cannot_tell"))
     return "not_visible";
   if (s.includes("not_applicable") || s === "na") return "not_applicable";
-  if (s.includes("present") || s.includes("found")) return "present";
+  // "ok_inferred" / "inferred" / "ok inferred" — satisfied without an explicit
+  // declaration (country of origin from an Indian address).
+  if (s.includes("inferred")) return "ok_inferred";
+  if (s.includes("present") || s.includes("found") || s === "ok" || s === "compliant")
+    return "present";
   if (s.includes("missing") || s.includes("absent")) return "missing";
   // No usable status from the model — fall back to the old present/issue shape.
   if (!present && /not applicable/i.test(issue ?? "")) return "not_applicable";
@@ -423,24 +428,31 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
     if (!isObj(v)) continue; // drop nulls / stray strings rather than render them
     const issue = str(v.issue);
     const present = v.present === true;
+    const status = complianceItemStatus(v.status, present, issue);
     legal_metrology_compliance[key] = {
       present,
       value: str(v.value),
-      compliant: v.compliant === true,
+      // "ok_inferred" is compliant by definition (satisfied without an explicit
+      // declaration), even if the model forgot to set compliant: true.
+      compliant: v.compliant === true || status === "ok_inferred",
       issue,
-      status: complianceItemStatus(v.status, present, issue),
+      note: str(v.note),
+      status,
     };
   }
 
   // Compliance is scored from the declarations that can actually be assessed
-  // (status "present" or "missing"). "not_visible" declarations — the off-panel
-  // MRP / net quantity / dates on a normal single-photo scan — are simply
-  // excluded, NOT a reason to discard the whole compliance verdict. It is only
-  // "insufficient" when barely anything on the label was captured at all.
+  // ("present", "ok_inferred" or "missing"). "not_visible" declarations — the
+  // off-panel MRP / net quantity / dates on a normal single-photo scan — are
+  // simply excluded, NOT a reason to discard the whole compliance verdict. It
+  // is only "insufficient" when barely anything on the label was captured.
   const assessableComplianceCount = Object.values(
     legal_metrology_compliance,
   ).filter(
-    (c) => c.status === "present" || c.status === "missing",
+    (c) =>
+      c.status === "present" ||
+      c.status === "ok_inferred" ||
+      c.status === "missing",
   ).length;
 
   const ingredient_analysis: IngredientAnalysis[] = (

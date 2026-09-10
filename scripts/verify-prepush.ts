@@ -1259,6 +1259,74 @@ check(
 );
 
 // ===========================================================================
+hr("COUNTRY OF ORIGIN — 'ok_inferred' status");
+// ===========================================================================
+{
+  const build = (coStatus: string, coExtra: Record<string, unknown>) => {
+    const r = raw({
+      name: "Indian Snack",
+      ingredients: [{ name: "Sugar", safety_status: "safe", source: "reference_database" }],
+      safety: 95,
+      compliance: 90,
+      flags: [{ nutrient: "Sugar", value_per_100: 2, unit: "g" }],
+    });
+    const l = r.legal_metrology_compliance as Record<string, Record<string, unknown>>;
+    l.country_of_origin = {
+      present: coStatus === "present",
+      value: null,
+      compliant: false, // deliberately wrong — normalize must fix it for ok_inferred
+      issue: null,
+      status: coStatus,
+      ...coExtra,
+    };
+    return r;
+  };
+
+  const inferred = run(
+    build("ok_inferred", {
+      value: "India (inferred from manufacturer address)",
+      note: "Manufacturer address indicates India but there is no explicit declaration.",
+    }),
+    "food_and_beverages",
+  );
+  const coi = inferred.legal_metrology_compliance.country_of_origin;
+  check("status survives normalize as 'ok_inferred'", coi.status === "ok_inferred", coi.status);
+  check("normalize forces compliant:true for ok_inferred (model sent false)", coi.compliant === true);
+  check("note is preserved", !!coi.note && /Manufacturer address/i.test(coi.note ?? ""));
+  check("value is preserved", coi.value === "India (inferred from manufacturer address)");
+  check(
+    "ok_inferred is assessable -> compliance still scored, not insufficient",
+    inferred.overall_assessment.compliance_score === 90 &&
+      inferred.overall_assessment.compliance_status === "ok",
+    `score=${inferred.overall_assessment.compliance_score}`,
+  );
+
+  // "ok inferred" / "inferred" spellings normalize too
+  check(
+    'model status "inferred from address" normalizes to ok_inferred',
+    run(build("inferred from address", {}), "food_and_beverages")
+      .legal_metrology_compliance.country_of_origin.status === "ok_inferred",
+  );
+  // "ok" (the string the user spec used for the explicit case) -> "present"
+  check(
+    'model status "ok" normalizes to "present" (explicit declaration)',
+    run(build("ok", { present: true, value: "India" }), "food_and_beverages")
+      .legal_metrology_compliance.country_of_origin.status === "present",
+  );
+
+  // A foreign product with a genuinely missing country of origin is still a violation.
+  const foreign = run(
+    build("missing", { issue: "No country-of-origin declaration; address is foreign." }),
+    "food_and_beverages",
+  );
+  check(
+    "missing country_of_origin stays 'missing' + compliant:false (imported-goods violation)",
+    foreign.legal_metrology_compliance.country_of_origin.status === "missing" &&
+      foreign.legal_metrology_compliance.country_of_origin.compliant === false,
+  );
+}
+
+// ===========================================================================
 hr(`RESULT: ${pass} passed, ${fail} failed`);
 if (failures.length) {
   console.log("FAILURES:");

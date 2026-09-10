@@ -73,12 +73,16 @@ export interface ProductInfo {
 /**
  * State of one mandatory declaration.
  * - present:        visible on the label
+ * - ok_inferred:    not explicitly declared, but satisfied by other visible
+ *                   text — currently only country_of_origin, resolved from a
+ *                   full Indian manufacturer address. Counts as compliant.
  * - missing:        label is legible and the declaration is genuinely absent
  * - not_visible:    could not tell — only part of the pack was photographed
  * - not_applicable: does not apply to this product category
  */
 export type ComplianceItemStatus =
   | "present"
+  | "ok_inferred"
   | "missing"
   | "not_visible"
   | "not_applicable";
@@ -88,6 +92,11 @@ export interface ComplianceItem {
   value: string | null;
   compliant: boolean;
   issue: string | null;
+  /**
+   * Neutral explanatory text (not a problem). Used for "ok_inferred" to say the
+   * label carries no explicit declaration but it was resolved from other text.
+   */
+  note?: string | null;
   /** Optional richer state; older stored rows may not have it. */
   status?: ComplianceItemStatus;
 }

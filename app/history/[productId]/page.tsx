@@ -17,6 +17,7 @@ import {
   Skull,
   ClipboardCheck,
   FlaskConical,
+  Info,
 } from "lucide-react";
 import { PageHeader } from "@/components/PageHeader";
 import { useToast } from "@/components/ToastProvider";
@@ -117,6 +118,10 @@ const declLabel = (k: string) => DECLARATION_LABELS[k] ?? titleCase(k);
 const isNotApplicable = (i: ComplianceItem) =>
   !i.present && i.compliant && /not applicable/i.test(i.issue ?? "");
 
+/** Compliant, incl. "ok_inferred" (satisfied without an explicit declaration). */
+const isCompliantItem = (v: ComplianceItem) =>
+  (v.present && v.compliant) || v.status === "ok_inferred";
+
 function complianceVerdict(row: ScanRow): {
   label: "Passed" | "Failed" | "Partial" | "Not assessed";
   color: string;
@@ -128,9 +133,9 @@ function complianceVerdict(row: ScanRow): {
     row.compliance_status ??
     (items.length === 0
       ? null
-      : items.every((v) => v.present && v.compliant)
+      : items.every(isCompliantItem)
         ? "compliant"
-        : items.some((v) => v.present && v.compliant)
+        : items.some(isCompliantItem)
           ? "partial"
           : "non_compliant");
   if (status === "compliant")
@@ -146,7 +151,7 @@ function complianceScore(cd: Record<string, ComplianceItem> | null): number {
   const items = Object.values(cd ?? {}).filter((v) => !isNotApplicable(v));
   if (!items.length) return 0;
   return Math.round(
-    (items.filter((v) => v.present && v.compliant).length / items.length) * 100,
+    (items.filter(isCompliantItem).length / items.length) * 100,
   );
 }
 
@@ -896,18 +901,25 @@ function ComplianceRow({
   item: ComplianceItem;
 }) {
   const state =
-    item.present && item.compliant
-      ? "ok"
-      : item.present
-        ? "issue"
-        : isNotApplicable(item)
-          ? "na"
-          : item.status === "not_visible"
-            ? "not_visible"
-            : "missing";
+    item.status === "ok_inferred"
+      ? "ok_inferred"
+      : item.present && item.compliant
+        ? "ok"
+        : item.present
+          ? "issue"
+          : isNotApplicable(item)
+            ? "na"
+            : item.status === "not_visible"
+              ? "not_visible"
+              : "missing";
   const icon =
     state === "ok" ? (
       <CheckCircle2 className="h-4 w-4 shrink-0 text-green-500" aria-hidden />
+    ) : state === "ok_inferred" ? (
+      <Info
+        className="h-4 w-4 shrink-0 text-teal-600 dark:text-teal-400"
+        aria-hidden
+      />
     ) : state === "issue" ? (
       <AlertTriangle className="h-4 w-4 shrink-0 text-amber-500" aria-hidden />
     ) : state === "na" || state === "not_visible" ? (
@@ -928,10 +940,16 @@ function ComplianceRow({
             {item.value}
           </p>
         )}
-        {item.issue && state !== "na" && state !== "not_visible" && (
-          <p className="text-xs text-amber-700 dark:text-amber-400">
-            {item.issue}
-          </p>
+        {item.issue &&
+          state !== "na" &&
+          state !== "not_visible" &&
+          state !== "ok_inferred" && (
+            <p className="text-xs text-amber-700 dark:text-amber-400">
+              {item.issue}
+            </p>
+          )}
+        {state === "ok_inferred" && (item.note || item.issue) && (
+          <p className="text-xs text-zinc-500">{item.note || item.issue}</p>
         )}
         {state === "missing" && !item.issue && (
           <p className="text-xs text-red-600 dark:text-red-400">
