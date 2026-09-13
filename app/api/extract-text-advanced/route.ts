@@ -30,21 +30,22 @@ const SUPPORTED_MEDIA_TYPES: readonly VisionMediaType[] = [
 /** ~5 MB decoded is Anthropic's per-image cap; base64 inflates it by ~4/3. */
 const MAX_BASE64_CHARS = 7_000_000;
 
-const SYSTEM_PROMPT = `You are an expert at reading text from product packaging images, including blurry, curved, small, and low-contrast text. This image has already been attempted by OCR and a smaller model, both of which failed to extract sufficient text. The text in this image may be rotated, curved around a cylindrical package, printed on crinkled foil, or partially obscured. Read it in whatever orientation it appears. If part of the label is cut off or unreadable, extract everything you can and note which sections were unreadable. Try your absolute best to read every piece of text on this package including:
-- Product name and brand
-- Complete ingredients list (this is the MOST important part)
-- MRP and price information
-- Manufacturing and expiry dates
-- Manufacturer name and address
-- FSSAI license number
-- Nutritional information table
-- Allergen declarations
-- Net weight/volume
-- Any warnings or claims
+// FIX 1.1 — this tier is the last, most expensive reader and had been prone to
+// narrating the photo instead of transcribing it. It is an OCR engine, not a
+// describer: output the literal printed text, organised by section, and
+// nothing else, followed only by the UNREADABLE_FIELDS line the app parses.
+const SYSTEM_PROMPT = `You are an OCR transcription engine reading a product package image that a smaller model already failed to extract enough text from. Output ONLY the text printed on the package, exactly as printed, organised by section (product name/brand, ingredients, MRP, dates, manufacturer, FSSAI licence, nutritional table, allergens, net weight, warnings).
 
-If certain areas are genuinely unreadable, note which fields you could not read and why (too blurry, obscured, etc). Return ALL text you can extract, organized by section.
+STRICT RULES:
+- Do NOT describe the image, packaging, lighting or photo quality
+- Do NOT write "Based on the image", "This appears to be", "I can make out", "Here's what I can partially make out", or any similar framing
+- Do NOT invent headings beyond the label's own sections, add commentary, or interpret
+- Do NOT summarise. Transcribe.
+- Where text is genuinely unreadable, write [unreadable] inline at that position and continue. Do not explain why inline — list it in UNREADABLE_FIELDS instead.
 
-After the extracted text, output one final line, exactly in this form and with nothing after it:
+Text may be rotated, curved around a cylinder, on crinkled foil, or in very small type. Read it in whatever orientation it appears. Work systematically across the whole label including the smallest print.
+
+After the transcription, output one final line, exactly in this form and with nothing after it:
 UNREADABLE_FIELDS: <comma-separated list of the fields you could not read, or the single word none>`;
 
 function jsonError(
@@ -77,12 +78,18 @@ function splitUnreadable(raw: string): {
 }
 
 export async function POST(request: Request) {
-  let body: { imageBase64?: unknown; mediaType?: unknown };
+  let body: { imageBase64?: unknown; mediaType?: unknown; retryHint?: unknown };
   try {
     body = await request.json();
   } catch {
     return jsonError("Request body must be valid JSON.", 400);
   }
+
+  // FIX 1.2 — when the caller detected a narration-style response from a
+  // previous call, it resends the SAME image with this hint so the retry is
+  // explicitly told to stop describing and start transcribing.
+  const retryHint =
+    typeof body.retryHint === "string" ? body.retryHint.trim().slice(0, 400) : "";
 
   let imageBase64 =
     typeof body.imageBase64 === "string" ? body.imageBase64.trim() : "";
@@ -122,6 +129,9 @@ export async function POST(request: Request) {
     const message = await anthropic.messages.create({
       model: CLAUDE_MODEL,
       max_tokens: 3000,
+      // FIX 9.1 — NOTE: `temperature` is deprecated/rejected (400) on
+      // claude-sonnet-5 — verified live against the real API. Not settable
+      // here; see extract-text/route.ts (Haiku) for the tier that can use it.
       // Extended thinking is on by default for claude-sonnet-5 and its tokens
       // come out of max_tokens, so a thinking block can swallow the whole
       // budget and leave no transcription behind. This tier only has to READ
@@ -142,7 +152,9 @@ export async function POST(request: Request) {
             },
             {
               type: "text",
-              text: "Read every piece of text on this product package, section by section, then finish with the UNREADABLE_FIELDS line.",
+              text: retryHint
+                ? `${retryHint}\n\nRead every piece of text on this product package, section by section, then finish with the UNREADABLE_FIELDS line.`
+                : "Read every piece of text on this product package, section by section, then finish with the UNREADABLE_FIELDS line.",
             },
           ],
         },

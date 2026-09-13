@@ -16,6 +16,7 @@ import type {
   DetectedCategory,
   DetectedCategoryId,
   SafetyStatus,
+  Verdict,
 } from "@/types/analysis";
 
 export interface CategoryPortal {
@@ -148,6 +149,36 @@ export const CATEGORY_META: Record<DetectedCategoryId, CategoryMeta> = {
     riskPhrase:
       "This ingredient does not meet the stricter safety standard for baby products.",
   },
+  general_merchandise: {
+    id: "general_merchandise",
+    label: "General Merchandise",
+    emoji: "📦",
+    tone: "zinc",
+    badgeClass:
+      "bg-zinc-200 text-zinc-700 dark:bg-white/10 dark:text-zinc-300",
+    accentClass: "border-zinc-400/40",
+    regulatoryBody: "Legal Metrology Department, Department of Consumer Affairs",
+    act: "Legal Metrology Act 2009 and Legal Metrology (Packaged Commodities) Rules 2011",
+    portals: [NCH],
+    scoreThreshold: 75,
+    complianceHeading: "Legal Metrology Compliance",
+    riskPhrase: "This product declares a material hazard on its packaging.",
+  },
+  drug_or_medical: {
+    id: "drug_or_medical",
+    label: "Medicine / Medical Device",
+    emoji: "💊",
+    tone: "purple",
+    badgeClass:
+      "bg-purple-100 text-purple-800 dark:bg-purple-500/15 dark:text-purple-300",
+    accentClass: "border-purple-500/40",
+    regulatoryBody: "CDSCO under the Drugs and Cosmetics Act 1940",
+    act: "Drugs and Cosmetics Act, 1940",
+    portals: [CDSCO],
+    scoreThreshold: 75,
+    complianceHeading: "Drug Labelling Compliance",
+    riskPhrase: "This is a medicinal product — consult a pharmacist or doctor.",
+  },
   unknown: {
     id: "unknown",
     label: "Uncategorised",
@@ -165,14 +196,74 @@ export const CATEGORY_META: Record<DetectedCategoryId, CategoryMeta> = {
   },
 };
 
-/** The five real categories a user can pick from when correcting a detection. */
+/** The categories a user can pick from when correcting a detection. */
 export const SELECTABLE_CATEGORIES: CategoryMeta[] = [
   CATEGORY_META.food_and_beverages,
   CATEGORY_META.personal_care,
   CATEGORY_META.household_cleaning,
   CATEGORY_META.baby_product_food,
   CATEGORY_META.baby_product_care,
+  CATEGORY_META.general_merchandise,
+  CATEGORY_META.drug_or_medical,
 ];
+
+// ---------------------------------------------------------------------------
+// FIX 6 — category-appropriate verdict wording. Food language ("Safe to
+// consume") must never appear on a non-food product.
+// ---------------------------------------------------------------------------
+
+const FOOD_VERDICT_LABEL: Record<Verdict, string> = {
+  safe: "Safe to consume",
+  caution: "Consume with caution",
+  limit: "Okay occasionally",
+  avoid: "Avoid this product",
+};
+const CARE_VERDICT_LABEL: Record<Verdict, string> = {
+  safe: "Safe to use",
+  caution: "Use with caution",
+  limit: "Use occasionally",
+  avoid: "Avoid this product",
+};
+const HOUSEHOLD_VERDICT_LABEL: Record<Verdict, string> = {
+  safe: "Safe to use as directed",
+  caution: "Use with care — follow safety instructions",
+  limit: "Use sparingly with precautions",
+  avoid: "Avoid this product",
+};
+/** general_merchandise has no 'limit' band — a 'limit' verdict reads as 'caution'. */
+const MERCHANDISE_VERDICT_LABEL: Record<Verdict, string> = {
+  safe: "Compliant",
+  caution: "Minor compliance issues",
+  limit: "Minor compliance issues",
+  avoid: "Significant compliance violations",
+};
+
+/**
+ * The verdict headline, worded for the product's actual category. Food
+ * language never reaches a non-food product, and a medicine ALWAYS shows the
+ * "consult a pharmacist" notice regardless of its underlying verdict.
+ */
+export function verdictLabel(
+  verdict: Verdict,
+  categoryId: DetectedCategoryId | null | undefined,
+): string {
+  switch (categoryId) {
+    case "drug_or_medical":
+      return "Consult a pharmacist or doctor";
+    case "personal_care":
+    case "baby_product_care":
+      return CARE_VERDICT_LABEL[verdict];
+    case "household_cleaning":
+      return HOUSEHOLD_VERDICT_LABEL[verdict];
+    case "general_merchandise":
+      return MERCHANDISE_VERDICT_LABEL[verdict];
+    case "food_and_beverages":
+    case "baby_product_food":
+    case "unknown":
+    default:
+      return FOOD_VERDICT_LABEL[verdict];
+  }
+}
 
 /**
  * Resolve a `detected_category` payload to its metadata, preferring the
@@ -240,4 +331,69 @@ export const BROAD_CATEGORY_FILTERS: {
     emoji: "🍼",
     match: ["baby_product_food", "baby_product_care"],
   },
+  {
+    key: "general_merchandise",
+    label: "General merchandise",
+    emoji: "📦",
+    match: ["general_merchandise"],
+  },
 ];
+
+// ---------------------------------------------------------------------------
+// FIX 5 — search subcategories, shown only once a broad type is chosen.
+// ---------------------------------------------------------------------------
+
+export interface Subcategory {
+  id: string;
+  label: string;
+}
+
+/** Keyed by the same `key` used in BROAD_CATEGORY_FILTERS. */
+export const SEARCH_SUBCATEGORIES: Record<string, Subcategory[]> = {
+  food_and_beverages: [
+    { id: "snacks", label: "Snacks" },
+    { id: "beverages", label: "Beverages" },
+    { id: "dairy", label: "Dairy" },
+    { id: "bakery", label: "Bakery" },
+    { id: "instant_food", label: "Instant food" },
+    { id: "sauces_condiments", label: "Sauces & condiments" },
+    { id: "breakfast_cereals", label: "Breakfast cereals" },
+    { id: "confectionery", label: "Confectionery" },
+    { id: "frozen_food", label: "Frozen food" },
+    { id: "baby_food", label: "Baby food" },
+    { id: "cooking_oils", label: "Cooking oils" },
+    { id: "spices", label: "Spices" },
+    { id: "meat_products", label: "Meat products" },
+    { id: "packaged_water", label: "Packaged water" },
+    { id: "packaged_fruits_vegetables", label: "Packaged fruits & vegetables" },
+  ],
+  personal_care: [
+    { id: "hair_care", label: "Hair care" },
+    { id: "skin_care", label: "Skin care" },
+    { id: "oral_care", label: "Oral care" },
+    { id: "body_wash_soap", label: "Body wash & soap" },
+    { id: "deodorant", label: "Deodorant" },
+    { id: "cosmetics", label: "Cosmetics" },
+    { id: "sun_care", label: "Sun care" },
+    { id: "shaving", label: "Shaving" },
+    { id: "feminine_hygiene", label: "Feminine hygiene" },
+  ],
+  household_cleaning: [
+    { id: "surface_cleaners", label: "Surface cleaners" },
+    { id: "laundry", label: "Laundry" },
+    { id: "dishwashing", label: "Dishwashing" },
+    { id: "toilet_bathroom", label: "Toilet & bathroom" },
+    { id: "air_fresheners", label: "Air fresheners" },
+    { id: "pest_control", label: "Pest control" },
+  ],
+  general_merchandise: [
+    { id: "stationery", label: "Stationery" },
+    { id: "electronics", label: "Electronics" },
+    { id: "hardware_tools", label: "Hardware & tools" },
+    { id: "kitchenware", label: "Kitchenware" },
+    { id: "textiles", label: "Textiles" },
+    { id: "footwear", label: "Footwear" },
+    { id: "toys", label: "Toys" },
+    { id: "batteries", label: "Batteries" },
+  ],
+};

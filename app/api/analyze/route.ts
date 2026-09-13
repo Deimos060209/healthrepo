@@ -85,12 +85,21 @@ const THINKING_OFF = { type: "disabled" } as const;
  * of the entire knowledge base.
  */
 const CATEGORY_ROUTER_SYSTEM = `Identify the product category from this text extracted from a photo. Return ONLY minified JSON:
-{"category":"food_and_beverages"|"personal_care"|"household_cleaning"|"baby_product_food"|"baby_product_care"|"not_a_packaged_product"|"unknown","confidence":"high"|"medium"|"low","signals":string[],"detected":string}
+{"category":"food_and_beverages"|"personal_care"|"household_cleaning"|"baby_product_food"|"baby_product_care"|"general_merchandise"|"drug_or_medical"|"not_a_packaged_product"|"unknown","confidence":"high"|"medium"|"low","signals":string[],"detected":string}
 
-Use category "not_a_packaged_product" when ANY of these hold:
-- there is no printed label text at all, or fewer than 15 meaningful words
-- the text describes loose produce, fresh fruit or vegetables, an unwrapped or home-made item, a person, a scene, a handwritten note, or anything that is not a manufactured labelled package
-- there is no MRP, no ingredients list, no manufacturer, no dates and no barcode anywhere in the text
+CATEGORY GUIDE:
+- drug_or_medical: eye drops, tablets, capsules, syrups, ointments, injections, medical devices, "Rx", "Schedule H", "for ophthalmic use", "as directed by physician", a drug licence number.
+- general_merchandise: stationery, electronics, hardware and tools, kitchenware, textiles, footwear, toys, batteries — any packaged commodity with printed text but no ingredients or nutrition panel. This is NOT "not_a_packaged_product" — it is a real category.
+- food_and_beverages / personal_care / household_cleaning / baby_product_food / baby_product_care: as before.
+
+FIX 7.1 — use "not_a_packaged_product" ONLY when the image shows an item with no packaging and no printed label whatsoever:
+- loose fresh produce (a single apple, loose vegetables, unwrapped fruit)
+- an unwrapped or unlabelled object
+- a person, scene, screenshot, document, or anything that is not a retail product
+- an image with no legible printed text at all (fewer than 15 meaningful words AND no MRP/ingredients/manufacturer/dates/barcode)
+
+An item IS a packaged product if it has ANY retail packaging with printed text, even with no ingredients list and no nutrition panel — that absence is NEVER a reason to reject it. Stationery, electronics, hardware, tools, kitchenware, textiles, footwear, toys and batteries are all packaged commodities under Legal Metrology and belong to general_merchandise, not not_a_packaged_product.
+
 "detected" = a short plain-language guess at what the photo actually shows (e.g. "a fresh apple", "loose vegetables", "an unpackaged item", "a person", "a printed page"). For a real package set "detected" to "".
 signals = up to 6 short words or phrases from the text that decided it. No prose, no code fences.`;
 
@@ -106,19 +115,21 @@ Before analysing, verify the text looks like real product packaging. If it is ga
 
 The product category has ALREADY been identified — see "ACTIVE CATEGORY" and the COMPACT REFERENCE DATA in the second system block. Do NOT re-derive it. Analyse the product strictly under that category's rules and set detected_category.category to the ACTIVE CATEGORY value.
 
-ANTI-HALLUCINATION — DO NOT INVENT WHAT YOU CANNOT SEE:
-NEVER produce a compliance verdict, safety score, or violation list for information that is not actually present in the extracted text.
+ACCURACY RULES (FIX 8.3 — this replaces the old "anti-hallucination" instruction, which was firing so readily that it nulled scores on labels that were perfectly readable):
+Never invent a value you cannot see, but do NOT under-score a label you CAN read.
 - A mandatory declaration that is not in the text because the text is incomplete or only part of the pack was photographed => status: "not_visible", NOT "missing". "missing" means the label is legible and the declaration is genuinely absent; "not_visible" means you cannot tell.
-- COMPLIANCE SCORING: score compliance ONLY from the declarations you can actually assess — the ones with status "present" or "missing". Declarations with status "not_visible" are EXCLUDED from the compliance score entirely and are NEVER counted as failures. A single-panel photo legitimately will not show the MRP, net quantity, manufacture date or unit sale price, and that is not a compliance problem — do not lower the score for it. If every assessable declaration is present and compliant, compliance_score should be high (90-100) even when several others are "not_visible". ONLY when FEWER THAN 2 declarations are assessable (almost the entire label is out of frame) set overall_assessment.compliance_score to null and overall_assessment.compliance_status to "insufficient_data".
-- If NO ingredients were found in the text, do NOT return a safety score: set overall_assessment.safety_score to null and overall_assessment.safety_status to "insufficient_data", and return ingredient_analysis as [].
+- COMPLIANCE SCORING: score compliance ONLY from the declarations you can actually assess — the ones with status "present" or "missing". Declarations with status "not_visible" are EXCLUDED from the compliance score entirely and are NEVER counted as failures. A single-panel photo legitimately will not show the MRP, net quantity, manufacture date or unit sale price, and that is not a compliance problem — do not lower the score for it. If every assessable declaration is present and compliant, compliance_score should be high (90-100) even when several others are "not_visible".
 - Never infer a product's identity from packaging colours or style. If the brand or product name is not legible in the text, set product_info.name (and brand) to null. NEVER return a guessed name, and NEVER put a hedge or disclaimer inside the name field (no "inferred from…", no "(not confirmed)").
-- When you can see enough to score normally, set safety_status and compliance_status to "ok".
+- Do NOT set safety_score or compliance_score to null yourself, and do NOT set safety_status / compliance_status to "insufficient_data" yourself. Report your classifications — every ingredient you can identify, every declaration's status — honestly and completely; the SERVER computes both scores downstream from those classifications, deterministically, every time. Your own safety_score / compliance_score / safety_status / compliance_status fields are advisory only and are never trusted over the server's arithmetic, so there is no reason to hedge them to null — always fill them in with your best-judgement number and "ok".
+- If the extracted text contains NO product label content at all — no ingredients, no declarations, no printed product information of any kind — set top-level early_verdict to "no_label_content" and return ingredient_analysis as []. That, and only that, is the signal for an unscoreable scan; do not reach for it just because part of the label is out of frame.
 
 CATEGORY-SPECIFIC RULES:
 - food_and_beverages / baby_product_food: check ingredients against banned_ingredients, harmful_additives and fssai_limits; check Legal Metrology + the FSSAI food labels; verify the 14-digit FSSAI licence format; flag allergens. Complaint portal: FSSAI Food Safety Connect.
 - personal_care / baby_product_care: check against the (cosmetic) banned_ingredients and harmful_additives lists. Do NOT flag ordinary cosmetic ingredients as 'harmful' — SLS/SLES in a wash-off product is 'caution', not 'harmful'; reserve 'harmful' for genuine dermal-absorption dangers. FSSAI licence / veg-nonveg / nutrition table are NOT applicable — mark those declarations present:false, compliant:true, issue:"Not applicable to personal care products". Complaint portal: CDSCO consumer corner + National Consumer Helpline.
 - household_cleaning: check against household_safety and surface each safety_note (ventilation, do-not-mix-with-bleach/ammonia). Treat a missing 'keep out of reach of children' warning or missing first-aid instructions as compliance issues. FSSAI / nutrition / veg-nonveg NOT applicable. Complaint portal: National Consumer Helpline + BIS.
 - baby_product_*: apply stricter_thresholds_note — zero tolerance for artificial colours, artificial sweeteners and harmful preservatives; flag even 'low' concern ingredients as 'caution'.
+- general_merchandise (FIX 7 — stationery, electronics, hardware/tools, kitchenware, textiles, footwear, toys, batteries): check ONLY generic name, net quantity, MRP, manufacturer/importer address, month/year of manufacture, consumer care, country of origin, dimensions where relevant. Do NOT check or flag ingredients, nutrition, FSSAI licence, allergens, veg/non-veg symbol or best-before — none of those apply, mark them not_applicable. Return ingredient_analysis as [] and omit nutritional_analysis. The ABSENCE of an ingredients list is never a compliance problem here. Complaint portal: National Consumer Helpline.
+- drug_or_medical (FIX 7 — eye drops, tablets, capsules, syrups, ointments, injections, medical devices, Rx/Schedule H): check ONLY drug licence number, batch number, manufacture/expiry dates, MRP, manufacturer details, composition (declared, not safety-scored), storage instructions, prescription status. NEVER give a safety verdict — safe or unsafe — on the active ingredients: return every active/composition entry in ingredient_analysis with safety_status "unknown" and reason "Active ingredient — HealthRepo does not give a safety verdict on medicines; consult a pharmacist or doctor." Omit nutritional_analysis. verdict and verdict_reason must talk about LABELLING COMPLIANCE ONLY, never about whether the medicine itself is safe to take. Complaint portal: CDSCO consumer corner.
 
 SAME INGREDIENT, DIFFERENT RATING BY CATEGORY (deliberate): Sodium Lauryl Sulfate in a SHAMPOO => 'caution'; in FOOD => 'harmful'. Tartrazine / synthetic dye in FOOD => 'harmful' (ingested, Southampton Six); in a rinse-off SHAMPOO => 'caution'. Judge every ingredient in the context of the ACTIVE CATEGORY.
 
@@ -129,7 +140,7 @@ Mapping: any match in banned_ingredients -> 'banned'. harmful_additives concern_
 Check explicitly for a benzoate (E210-E213) together with ascorbic acid / vitamin C (E300) -> benzene risk; emit it as its own ingredient_analysis entry.
 Also return 'ingredients_not_in_database' for every ingredient you flagged from your own knowledge.
 
-DOSAGE AND LIMIT CHECKING (food categories only — for personal_care / household_cleaning return additive_count zeroed, limit_checks [], cumulative_risk 'low', daily_intake_warning null, combination_warnings []):
+DOSAGE AND LIMIT CHECKING (food categories only — for personal_care / household_cleaning / general_merchandise / drug_or_medical return additive_count zeroed, limit_checks [], cumulative_risk 'low', daily_intake_warning null, combination_warnings []):
 For each additive in the ingredients list, match it against fssai_limits (name / also_known_as / e_code / ins_code) and use the special_limits entry for this product type where one applies, otherwise fssai_max_limit_mg_per_kg (null = permitted at GMP). If the label declares a quantity, compare and set 'within_limit' / 'exceeds_limit'; otherwise 'quantity_not_declared'. Add a combination_warnings entry when several preservatives or several colours are present, or for benzoate + ascorbic acid. Where an ADI and a declared or estimable concentration exist, compute how much of the product a 60 kg adult can safely have per day and put it in daily_intake_warning (assume a 600 ml bottle / 250 ml glass for drinks, a 50 g pack for snacks); otherwise null.
 
 NUTRITIONAL ASSESSMENT — FOOD CATEGORIES ONLY (food_and_beverages, baby_product_food). Do this IN ADDITION to the safety analysis. For personal_care, household_cleaning and baby_product_care, omit nutritional_analysis entirely.
@@ -137,6 +148,17 @@ NUTRITIONAL ASSESSMENT — FOOD CATEGORIES ONLY (food_and_beverages, baby_produc
 A product with no banned substances and no harmful additives is NOT automatically healthy. Assess nutritional quality separately.
 
 CONTEXT: This app serves Indian consumers. Rice, wheat, pulses and cooking oils are dietary staples eaten daily by hundreds of millions of people as part of balanced meals with dal, vegetables and dairy. Do NOT moralise about staple foods. A bag of white rice is not a health hazard — it is a normal, affordable food. Note honestly that brown rice or hand-pounded rice retains more fibre, but never frame plain rice as something to avoid. Reserve strong negative language for genuinely problematic products: ultra-processed foods, sugar-sweetened beverages, trans fats, and products with harmful additives. The tone for a staple should be informative, not corrective.
+
+PRODUCT PURPOSE (FIX 2) — determine this BEFORE nutritional scoring, in addition to food_type. Classify the intended dietary role:
+- 'hydration' — drinking water, mineral water, plain soda water, unsweetened clear beverages.
+- 'seasoning' — salt, spices, spice blends, masalas, herbs, pepper, vinegar, baking soda.
+- 'condiment' — pickles, chutneys, sauces, jams, ketchup, mustard. Small accompanying quantities.
+- 'beverage' — juices, soft drinks, milk drinks, tea, coffee. Consumed in volume.
+- 'staple_food' — grains, flours, pulses, oils, dairy. Forms the substance of a meal.
+- 'snack_or_meal' — biscuits, chips, ready meals, noodles, confectionery, cereals.
+Return top-level product_purpose and a one-line purpose_note. Scoring effect (the SERVER applies this, but classify honestly): 'hydration' and 'seasoning' have NO nutrition score — do not moralise about a bag of salt or a bottle of water. 'condiment' is scored per-serving (a pickle at 2000 mg sodium/100 g is really ~200-300 mg per 10-20 g serving) — say so in moderation_advice. CRITICAL — purpose leniency must NEVER leak: a sugar-sweetened soft drink is 'beverage', never 'hydration'. If a drink contains added sugar, sweeteners, colours or flavours it is 'beverage'. Only genuinely plain water is 'hydration'.
+
+TRADITIONAL PRESERVED FOODS (FIX 3): pickles, achaar, murabba, chutneys, fermented foods and papad have long ingredient lists because they contain many spices, not because they are industrially formulated. An "additive" for the ultra-processed count is an E-number, an INS code, or a named industrial compound (preservative, emulsifier, stabiliser, artificial colour, artificial flavour, humectant, anti-caking agent) — whole spices, herbs, salt, oil, vinegar, sugar and lemon juice are NOT additives, however many of them appear. Do NOT apply the ultra-processed flag to a traditional preserved food unless it contains 3 or more genuine E-number/INS-coded additives. Salt in a pickle is the preservation mechanism, not a fault — flag it as informational only, noting pickles are high in sodium and eaten in small amounts.
 
 FOOD TYPE CLASSIFICATION — determine this before nutritional scoring:
 - 'staple_ingredient' — a basic cooking ingredient, typically 1-3 ingredients, that a person combines with other foods to make a meal. Rice, wheat flour, pulses, plain pasta, oils, sugar, salt, spices, plain dairy, eggs. The consumer controls how it is used.
@@ -195,9 +217,9 @@ COUNTRY OF ORIGIN — status rules (base the decision ONLY on the visible label 
    { name, safety_status: 'safe'|'caution'|'harmful'|'banned'|'unknown', reason (one line), health_effects, who_should_avoid, banned_in_countries (string[]), healthier_alternative, source: 'reference_database'|'ai_knowledge', personal_flags: array of { reason, severity } }.
    Per "KEEP IT SHORT" above, the four long fields stay empty for 'reference_database' ingredients.
 
-4. overall_assessment: { safety_score: 0-100 or null, compliance_score: 0-100 or null, safety_status: "ok"|"insufficient_data", compliance_status: "ok"|"insufficient_data", summary: string (MAX 3 sentences — this is shown only inside a collapsed "Full assessment" section, so it does not need to lead), recommendation: string }. Per the ANTI-HALLUCINATION rules, a score is null exactly when its status is "insufficient_data". safety_score covers banned substances and harmful additives ONLY — nutritional quality is scored separately by the server and must not bleed into it.
+4. overall_assessment: { safety_score: 0-100, compliance_score: 0-100, safety_status: "ok", compliance_status: "ok", summary: string (MAX 3 sentences — this is shown only inside a collapsed "Full assessment" section, so it does not need to lead), recommendation: string }. Per the ACCURACY RULES above, give your best-judgement number here even on a partial label — the SERVER computes the real safety_score / compliance_score from your classifications and IGNORES these; they are advisory only, so there is no reason to send null. safety_score covers banned substances and harmful additives ONLY — nutritional quality is scored separately by the server and must not bleed into it.
 
-4a. verdict: one of 'safe' | 'caution' | 'limit' | 'avoid' — the single top-line call the user sees first. 'safe' roughly maps to safety_score >= 75 AND a good nutrition score with no harmful/banned ingredients; 'avoid' to any banned ingredient, a serious personal_alert, safety_score < 50, or a product that is nutritionally very poor; 'limit' to a product with nothing harmful in it that is nonetheless nutritionally poor (refined grain, high sugar, ultra-processed); 'caution' otherwise. The server recomputes this from the three scores, so give your best judgement and do not agonise. If safety_status is "insufficient_data", still give your best-judgement verdict from what you could read.
+4a. verdict: one of 'safe' | 'caution' | 'limit' | 'avoid' — the single top-line call the user sees first. 'safe' roughly maps to safety_score >= 75 AND a good nutrition score with no harmful/banned ingredients; 'avoid' to any banned ingredient, a serious personal_alert, safety_score < 50, or a product that is nutritionally very poor; 'limit' to a product with nothing harmful in it that is nonetheless nutritionally poor (refined grain, high sugar, ultra-processed); 'caution' otherwise. The server recomputes this from the three scores, so give your best judgement and do not agonise. NEVER phrase verdict_reason, summary or recommendation using food-consumption language ("safe to consume", "safe to eat") for a non-food category (personal_care, household_cleaning, general_merchandise, drug_or_medical) — the client applies its own category-appropriate wording ("safe to use", "compliant", etc.); write your text in a way that is true for ANY category (e.g. "no banned ingredients found", "fully compliant with labelling rules").
 
 4b. verdict_reason: ONE plain sentence backing the verdict, MAXIMUM 20 words. No lists, no semicolons.
 
@@ -213,11 +235,15 @@ COUNTRY OF ORIGIN — status rules (base the decision ONLY on the visible label 
 
 9. detected_category: { category: the ACTIVE CATEGORY value, confidence: 'high'|'medium'|'low', signals_found: string[], regulatory_body: string, applicable_act: string, complaint_portal: string } — take regulatory_body / applicable_act / complaint_portal from the ACTIVE CATEGORY block.
 
-10. nutritional_analysis — FOOD CATEGORIES ONLY; omit this key entirely for personal_care, household_cleaning and baby_product_care:
+10. nutritional_analysis — FOOD CATEGORIES ONLY; omit this key entirely for personal_care, household_cleaning, baby_product_care, general_merchandise and drug_or_medical:
 { nutrition_score: number, nutrition_data_complete: boolean, food_type: 'staple_ingredient'|'minimally_processed'|'processed_product', food_type_reason: string, nutrient_density: 'high'|'moderate'|'low'|'empty', density_note: string, primary_concern: null, concerns: [{ ingredient, concern_type: 'refined_grain'|'added_sugar'|'refined_oil'|'high_sodium'|'saturated_fat'|'trans_fat'|'processed_protein'|'low_nutrient_density', concern_level: 'mild'|'moderate'|'significant', why_flagged, health_effects, moderation_guidance, better_alternative, who_should_limit: string[], score_penalty: number, source: 'reference_database'|'ai_knowledge' }], threshold_flags: [{ nutrient, value_per_100: number, unit: 'g'|'mg', level: 'low'|'medium'|'medium_high'|'high'|'very_high', penalty: number }], positive_notes: string[], sugar_alias_count: number, sugar_aliases_found: string[], is_ultra_processed: boolean, ingredient_order_note: string|null, moderation_advice: string, nutritional_concerns_not_in_database: string[] }
 Give nutrition_score, level and penalty your best estimate and set primary_concern to null — the SERVER recomputes nutrition_score, every band and penalty, the score ceilings, the food_type scale, the nutrient_density downgrades, the positive-nutrition bonuses and primary_concern from your identifications, so accuracy of identification (an honest food_type and nutrient_density) matters far more than accuracy of arithmetic. Read the Protein row off the panel too when it is present.
 
-If the text is too garbled or sparse to identify a product, still return the full JSON structure with best-effort nulls, empty arrays, zeroed additive_count, cumulative_risk 'low', empty personal_flags/personal_alerts, safety_score null + safety_status "insufficient_data", compliance_score null + compliance_status "insufficient_data", verdict 'caution', verdict_reason "Not enough of the label was readable to judge this product.", key_findings ["Only part of the label could be read"], detected_category with the ACTIVE CATEGORY value and confidence 'low', and a summary explaining the text could not be reliably read.`;
+11. product_purpose (food categories only; omit for non-food): one of 'hydration'|'seasoning'|'condiment'|'beverage'|'staple_food'|'snack_or_meal', per the PRODUCT PURPOSE rules above. purpose_note: one plain sentence.
+
+12. early_verdict: omit this key entirely for a normal scan. Set it to "no_label_content" ONLY when the extracted text has no product label content at all — see the ACCURACY RULES above. This is the rare case, not the default.
+
+If the text is too garbled or sparse to identify a product AT ALL (not merely partial), still return the full JSON structure with best-effort nulls, empty arrays, zeroed additive_count, cumulative_risk 'low', empty personal_flags/personal_alerts, verdict 'caution', verdict_reason "Not enough of the label was readable to judge this product.", key_findings ["Only part of the label could be read"], detected_category with the ACTIVE CATEGORY value and confidence 'low', early_verdict "no_label_content", and a summary explaining the text could not be reliably read.`;
 
 const VALID_CATEGORY_OVERRIDES: DetectedCategoryId[] = [
   "food_and_beverages",
@@ -225,6 +251,8 @@ const VALID_CATEGORY_OVERRIDES: DetectedCategoryId[] = [
   "household_cleaning",
   "baby_product_food",
   "baby_product_care",
+  "general_merchandise",
+  "drug_or_medical",
 ];
 
 function jsonError(message: string, status: number, extra?: Record<string, unknown>) {
@@ -318,6 +346,9 @@ async function routeCategory(text: string): Promise<{
     const msg = await anthropic.messages.create({
       model: HAIKU_MODEL,
       max_tokens: 200,
+      // FIX 9.1 — determinism. The default temperature (1.0) samples randomly;
+      // the same label re-scanned must route to the same category every time.
+      temperature: 0,
       system: CATEGORY_ROUTER_SYSTEM,
       messages: [{ role: "user", content: text.slice(0, 6000) }],
     });
@@ -439,8 +470,11 @@ export async function POST(request: Request) {
       {
         error: "not_a_packaged_product",
         detected: routed.detected || null,
+        // FIX 7.3 — never imply a missing ingredients list was the reason.
+        // Most legitimate packaged products (stationery, electronics,
+        // hardware) have no ingredients list at all.
         message:
-          "We couldn't find any product label in this photo. HealthRepo analyses packaged products — the ingredients list, MRP, dates and manufacturer details printed on the pack.",
+          "We couldn't find any retail packaging or printed label in this photo. HealthRepo analyses packaged products using the information printed on the pack.",
       },
       { status: 422 },
     );
@@ -479,6 +513,13 @@ export async function POST(request: Request) {
       .stream({
         model: CLAUDE_MODEL,
         max_tokens: MAX_OUTPUT_TOKENS,
+        // FIX 9.1 — determinism. NOTE: `temperature` is deprecated/rejected
+        // (400 invalid_request_error) on claude-sonnet-5 — verified live
+        // against the real API during this fix. It is NOT settable here.
+        // Local scoring (FIX 8.1) is what actually makes re-scans consistent:
+        // identical classifications always produce identical arithmetic.
+        // Minor variation in the model's own ingredient classifications can
+        // still occur — that is inherent to the model, not this app.
         thinking: THINKING_OFF,
         // Block 1 is fully static (one cache entry for all scans); block 2 is
         // the category-scoped compact reference (one entry per category). The
@@ -522,10 +563,13 @@ export async function POST(request: Request) {
     // Recognised Anthropic outages (out of credits, rate limit, overload, bad
     // key, connectivity) become a specific, non-leaky error code + retryable
     // flag; anything else stays a generic 502.
-    return (
-      handleAnthropicError(err, "analyze:sonnet") ??
-      jsonError("The analysis service failed to respond.", 502)
-    );
+    const handled = handleAnthropicError(err, "analyze:sonnet");
+    if (!handled) {
+      // TEMP DEBUG — an unclassified error reaching here is otherwise
+      // completely silent (no server log at all). Remove once diagnosed.
+      console.error("ANALYZE_SONNET_UNCLASSIFIED_ERROR", err);
+    }
+    return handled ?? jsonError("The analysis service failed to respond.", 502);
   }
 
   if (!responseText) {
@@ -586,7 +630,13 @@ export async function POST(request: Request) {
     // asks for it to be zeroed outside the food categories, but the model
     // occasionally counts a cosmetic preservative anyway — enforce it here so a
     // shampoo can never be shown an "additive dosage" verdict.
-    if (activeCategory === "personal_care" || activeCategory === "household_cleaning" || activeCategory === "baby_product_care") {
+    if (
+      activeCategory === "personal_care" ||
+      activeCategory === "household_cleaning" ||
+      activeCategory === "baby_product_care" ||
+      activeCategory === "general_merchandise" ||
+      activeCategory === "drug_or_medical"
+    ) {
       analysis.dosage_analysis = {
         additive_count: {
           preservatives: 0, colors: 0, sweeteners: 0, antioxidants: 0,

@@ -21,6 +21,7 @@ import { supabase } from "@/lib/supabase";
 import { PRODUCT_CATEGORIES } from "@/lib/reference-data";
 import {
   BROAD_CATEGORY_FILTERS,
+  SEARCH_SUBCATEGORIES,
   categoryScoreThreshold,
 } from "@/lib/product-category";
 import type { IngredientAnalysis } from "@/types/analysis";
@@ -95,20 +96,27 @@ function scoreBadge(score: number | null): { bg: string; value: string } {
   return { bg: "bg-red-600", value: String(s) };
 }
 
-const STATUS: Record<Flag, { label: string; cls: string }> = {
-  safe: {
-    label: "✅ Safe to consume",
-    cls: "text-green-700 dark:text-green-400",
-  },
-  concerning: {
-    label: "⚠️ Contains concerning ingredients",
-    cls: "text-amber-700 dark:text-amber-400",
-  },
-  harmful: {
-    label: "🚫 Contains harmful/banned ingredients",
-    cls: "text-red-700 dark:text-red-400",
-  },
-};
+/**
+ * FIX 6 — "My scans" has no detected_category id on the row (only the free-text
+ * subcategory saved with the scan), so this is a best-effort keyword match
+ * rather than the strict verdictLabel() the results screen uses. It still
+ * ensures a shampoo never reads "Safe to consume".
+ */
+function statusFor(flag: Flag, category: string | null): { label: string; cls: string } {
+  const cat = (category ?? "").toLowerCase();
+  const isCare = /personal.?care|cosmetic|shampoo|soap|skin|hair|deodorant/.test(cat);
+  const isHousehold = /household|clean|detergent/.test(cat);
+  if (flag === "concerning") {
+    return { label: "⚠️ Contains concerning ingredients", cls: "text-amber-700 dark:text-amber-400" };
+  }
+  if (flag === "harmful") {
+    return { label: "🚫 Contains harmful/banned ingredients", cls: "text-red-700 dark:text-red-400" };
+  }
+  // flag === "safe"
+  if (isCare) return { label: "✅ Safe to use", cls: "text-green-700 dark:text-green-400" };
+  if (isHousehold) return { label: "✅ Safe to use as directed", cls: "text-green-700 dark:text-green-400" };
+  return { label: "✅ Safe to consume", cls: "text-green-700 dark:text-green-400" };
+}
 
 const catLabelFor = (category: string | null): string => {
   if (!category) return "Uncategorised";
@@ -327,35 +335,50 @@ function SafeProductsTab() {
 
       {/* Broad regulatory category — food / personal care / household / baby */}
       <div className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-1">
-        <FilterChip active={broadCat === ""} onClick={() => setBroadCat("")}>
+        <FilterChip
+          active={broadCat === ""}
+          onClick={() => {
+            setBroadCat("");
+            setCategory("");
+          }}
+        >
           All types
         </FilterChip>
         {BROAD_CATEGORY_FILTERS.map((b) => (
           <FilterChip
             key={b.key}
             active={broadCat === b.key}
-            onClick={() => setBroadCat(broadCat === b.key ? "" : b.key)}
+            onClick={() => {
+              // FIX 5 — the subcategory is meaningless once its parent type
+              // changes, so it always resets alongside broadCat.
+              setBroadCat(broadCat === b.key ? "" : b.key);
+              setCategory("");
+            }}
           >
             <span aria-hidden>{b.emoji}</span> {b.label}
           </FilterChip>
         ))}
       </div>
 
-      {/* Category filter chips */}
-      <div className="-mx-1 flex gap-1.5 overflow-x-auto px-1 pb-1">
-        <FilterChip active={category === ""} onClick={() => setCategory("")}>
-          All
-        </FilterChip>
-        {PRODUCT_CATEGORIES.map((c) => (
-          <FilterChip
-            key={c.id}
-            active={category === c.id}
-            onClick={() => setCategory(category === c.id ? "" : c.id)}
-          >
-            <span aria-hidden>{c.icon_emoji}</span> {c.name}
+      {/* FIX 5 — subcategory chips ONLY once a specific type is chosen, scoped
+          to that type's own subcategories. Hidden entirely at "All types",
+          where a subcategory list is meaningless. */}
+      {broadCat && SEARCH_SUBCATEGORIES[broadCat] && (
+        <div className="-mx-1 flex animate-[fadeIn_0.15s_ease-out] gap-1.5 overflow-x-auto px-1 pb-1">
+          <FilterChip active={category === ""} onClick={() => setCategory("")}>
+            All
           </FilterChip>
-        ))}
-      </div>
+          {SEARCH_SUBCATEGORIES[broadCat].map((c) => (
+            <FilterChip
+              key={c.id}
+              active={category === c.id}
+              onClick={() => setCategory(category === c.id ? "" : c.id)}
+            >
+              {c.label}
+            </FilterChip>
+          ))}
+        </div>
+      )}
 
       {/* Score filter */}
       <div className="flex flex-wrap gap-1.5">
@@ -1019,7 +1042,7 @@ function ResultCard({
 }) {
   const [imageFailed, setImageFailed] = useState(false);
   const badge = scoreBadge(group.bestScore);
-  const status = STATUS[group.flag];
+  const status = statusFor(group.flag, group.category);
   const cat = group.category ? CATEGORY_MAP.get(group.category) : undefined;
   const catLabel = cat
     ? `${cat.icon_emoji} ${cat.name}`

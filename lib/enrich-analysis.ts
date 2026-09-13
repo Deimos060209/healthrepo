@@ -37,6 +37,9 @@ import type {
   PersonalFlag,
   UserHealthProfileInput,
   Verdict,
+  DosageAnalysis,
+  LegalMetrologyCompliance,
+  ProductPurpose,
 } from "@/types/analysis";
 import {
   BANNED_INGREDIENTS,
@@ -365,10 +368,14 @@ function looksLikeBeverage(a: ProductAnalysis): boolean {
 /** Apply the baby-food multiplier to a threshold's bands. */
 function scaleThreshold(t: NutrientThreshold, factor: number): NutrientThreshold {
   if (factor === 1) return t;
+  const note =
+    factor < 1
+      ? "halved for baby food"
+      : "widened for a small per-serving portion, not the full 100 g";
   return {
     ...t,
     bands: t.bands.map((b) => ({ ...b, above: b.above * factor })),
-    reference: `${t.reference} (halved for baby food)`,
+    reference: `${t.reference} (${note})`,
   };
 }
 
@@ -384,7 +391,7 @@ function scoreThreshold(
   key: ThresholdKey,
   rawValue: number,
   rawUnit: string,
-  opts: { beverage: boolean; babyFactor: number },
+  opts: { beverage: boolean; bandFactor: number },
 ): ScoredFlag | null {
   const T = NUTRITIONAL_THRESHOLDS;
   let value = rawValue;
@@ -432,7 +439,7 @@ function scoreThreshold(
   switch (key) {
     case "sugar":
       base = opts.beverage ? T.sugar_liquid : T.sugar_solid;
-      base = scaleThreshold(base, opts.babyFactor);
+      base = scaleThreshold(base, opts.bandFactor);
       unit = "g";
       break;
     case "sodium":
@@ -441,11 +448,11 @@ function scoreThreshold(
       if (/^g$/i.test(rawUnit.trim()) || /salt/i.test(rawUnit)) {
         value = rawValue * 400; // g salt -> mg sodium
       }
-      base = scaleThreshold(T.sodium, opts.babyFactor);
+      base = scaleThreshold(T.sodium, opts.bandFactor);
       unit = "mg";
       break;
     case "saturated_fat":
-      base = scaleThreshold(T.saturated_fat, opts.babyFactor);
+      base = scaleThreshold(T.saturated_fat, opts.bandFactor);
       unit = "g";
       break;
     case "total_fat":
@@ -491,6 +498,30 @@ const num = (v: unknown): number | null => {
 
 /** E-number / INS code in an ingredient name — the ultra-processing signal. */
 const ADDITIVE_CODE = /\b(e\s?-?\d{3,4}[a-z]?|ins\s?-?\d{3,4}[a-z]?)\b/i;
+const ADDITIVE_CODE_G = /\b(e\s?-?\d{3,4}[a-z]?|ins\s?-?\d{3,4}[a-z]?)\b/gi;
+
+/**
+ * FIX 3.1 — the actual E-numbers / INS codes found, for naming the
+ * ultra-processed banner instead of a bare "Ultra-processing" label. Whole
+ * spices, herbs, salt, oil, vinegar, sugar and lemon juice never match this —
+ * only a genuine coded industrial additive does.
+ */
+function extractAdditiveCodes(names: string[]): string[] {
+  const codes = new Set<string>();
+  for (const n of names) {
+    const hits = n.match(ADDITIVE_CODE_G);
+    if (hits) for (const h of hits) codes.add(h.toUpperCase().replace(/\s+/g, ""));
+  }
+  return Array.from(codes);
+}
+
+/**
+ * FIX 3.2 — pickles, achaar, murabba, chutneys, fermented foods and papad have
+ * long ingredient lists because they carry many spices, not because they are
+ * industrially formulated. Salt is their preservation mechanism, not a fault.
+ */
+const TRADITIONAL_PRESERVED_RE =
+  /\b(pickle|achaar|achar|murabba|chutney|papad|fermented|kanji|sauerkraut)\b/i;
 
 // ---------------------------------------------------------------------------
 // Nutrient density
@@ -845,6 +876,7 @@ function computePositives(ctx: {
 function buildNutritionalAnalysis(
   a: ProductAnalysis,
   category: string,
+  purpose: ProductPurpose | null = null,
 ): NutritionalAnalysis | null {
   if (!isFoodCategory(category)) return null;
 
@@ -860,6 +892,15 @@ function buildNutritionalAnalysis(
     typeof v === "string" && v.trim() ? v.trim() : null;
   const isBaby = category === "baby_product_food";
   const babyFactor = isBaby ? T.baby_threshold_multiplier : 1;
+  // FIX 2 (condiment) — "a pickle at 2000 mg sodium per 100 g delivers
+  // roughly 200-300 mg per serving" (a 10-20 g serving, not 100 g): widen the
+  // band cutoffs ~5x so the SAME per-100g reading does not trip the same
+  // hard "very_high" ceiling a food eaten by the bowlful would. Combined
+  // multiplicatively with babyFactor (the two conditions cannot co-occur in
+  // practice, but nothing breaks if they somehow do).
+  const CONDIMENT_SERVING_FACTOR = 5;
+  const bandFactor =
+    babyFactor * (purpose === "condiment" ? CONDIMENT_SERVING_FACTOR : 1);
   const beverage = looksLikeBeverage(a);
 
   // ---- 1. Concerns ------------------------------------------------------
@@ -961,7 +1002,7 @@ function buildNutritionalAnalysis(
     const value = num(f.value_per_100);
     if (value === null || value < 0) continue;
     const unit = String(f.unit ?? "g");
-    const flag = scoreThreshold(key, value, unit, { beverage, babyFactor });
+    const flag = scoreThreshold(key, value, unit, { beverage, bandFactor });
     if (flag) scored.set(key, flag);
   }
   const threshold_flags: ThresholdFlag[] = Array.from(scored.values()).map(
@@ -979,13 +1020,22 @@ function buildNutritionalAnalysis(
   const codedAdditives = (a.ingredient_analysis ?? []).filter((i) =>
     ADDITIVE_CODE.test(i?.name ?? ""),
   ).length;
-  const additiveCount = Math.max(
-    codedAdditives,
-    a.dosage_analysis?.additive_count?.total ?? 0,
+  // FIX 3.1 — an "additive" for the ultra-processing count is a genuine
+  // E-number / INS code ONLY. The model's own dosage_analysis.additive_count
+  // (which lumps whole spices, herbs and salt in with "flavor_enhancers" /
+  // "colors") is no longer trusted here — that miscount is exactly what got a
+  // traditional pickle called "ultra-processed" for its spice list.
+  const additiveCount = codedAdditives;
+  const isTraditionalPreserved = TRADITIONAL_PRESERVED_RE.test(
+    [String(a.product_info?.name ?? ""), ...ingredientNames].join(" ; "),
   );
   const is_ultra_processed =
     ingredientCount > T.ultra_processing.min_ingredients_exclusive &&
-    additiveCount >= T.ultra_processing.min_additives;
+    additiveCount >= T.ultra_processing.min_additives &&
+    // FIX 3.2 — a traditional preserved food needs 3+ GENUINE coded additives,
+    // same bar as everything else; this guard just makes the intent explicit
+    // and survives even if a future change loosens additiveCount's source.
+    (!isTraditionalPreserved || codedAdditives >= T.ultra_processing.min_additives);
 
   const productName = String(a.product_info?.name ?? "");
   // 'processed_product' is normalizeNutritionalAnalysis()'s default when the
@@ -1086,26 +1136,39 @@ function buildNutritionalAnalysis(
     }
   }
 
+  // FIX 2 (condiment) — a serving is 10-20 g, not 100 g: halve every threshold
+  // penalty for a condiment (pickles, chutneys, sauces eaten in small amounts).
+  const purposeMult = purpose === "condiment" ? 0.5 : 1;
+
   // Threshold penalties apply at full strength to every food type — a staple
   // that IS 100% sugar or fat should still be flagged.
   for (const f of threshold_flags) {
     if (f.penalty <= 0) continue; // fibre / protein markers are handled as bonuses
-    thresholdPenalties += f.penalty;
-    contributors.push({
-      label: f.nutrient,
-      level: f.level,
-      penalty: f.penalty,
-      kind: "nutrient",
-      value: f.value_per_100,
-      unit: f.unit,
-    });
+    const charged = Math.round(f.penalty * purposeMult);
+    thresholdPenalties += charged;
+    if (charged > 0) {
+      contributors.push({
+        label: f.nutrient,
+        level: f.level,
+        penalty: charged,
+        kind: "nutrient",
+        value: f.value_per_100,
+        unit: f.unit,
+      });
+    }
   }
 
-  // Ultra-processing + the sugar-alias rule: products only, never staples.
-  if (is_ultra_processed && !isStaple) {
+  // Ultra-processing + the sugar-alias rule: products only, never staples, and
+  // never a traditional preserved food (FIX 3.2) — its long ingredient list is
+  // spices, not industrial formulation.
+  if (is_ultra_processed && !isStaple && !isTraditionalPreserved) {
     concernPenalties += T.ultra_processing.penalty;
+    // FIX 3.3 — name the actual triggers rather than a bare "Ultra-processing".
+    const codes = extractAdditiveCodes(ingredientNames);
     contributors.push({
-      label: "Ultra-processing",
+      label: codes.length
+        ? `Ultra-processing (${codes.join(", ")})`
+        : "Ultra-processing",
       level: "significant",
       penalty: T.ultra_processing.penalty,
       kind: "rule",
@@ -1258,9 +1321,18 @@ function buildNutritionalAnalysis(
       STAPLE_USE_SPARINGLY_RE.test(
         [productName, firstThreeNames[0] ?? ""].join(" ; "),
       ));
-  const moderation_advice =
+  let moderation_advice =
     rawStr(raw?.moderation_advice) ??
     deriveModerationAdvice(nutrition_score, concerns, food_type, stapleSparing);
+
+  // FIX 3.2 — a pickle's sodium is the preservation mechanism, not a fault;
+  // say so explicitly rather than just penalising it like an ordinary product.
+  if (isTraditionalPreserved) {
+    const sodiumFlag = scored.get("sodium");
+    if (sodiumFlag && sodiumFlag.level !== "low") {
+      moderation_advice = `${moderation_advice} Traditional preserved foods like pickles and achaar are naturally high in sodium — the salt is part of the preservation process, and they are eaten in small accompanying amounts, not as a main dish.`;
+    }
+  }
 
   return {
     nutrition_score,
@@ -1340,10 +1412,11 @@ function buildPrimaryConcern(
         ? `${adj} ${noun} — ${top.value} ${top.unit ?? "g"} ${basis}.`
         : `${adj} ${noun}.`;
   } else if (top.kind === "rule") {
-    explanation =
-      top.label === "Ultra-processing"
-        ? "This is an ultra-processed food — many ingredients and multiple additives."
-        : "Sugar is listed under several different names, which hides the true total.";
+    explanation = top.label.startsWith("Ultra-processing")
+      ? `This is an ultra-processed food — contains ${
+          top.label.includes("(") ? top.label.slice(top.label.indexOf("(") + 1, -1) : "several industrial additives"
+        }.`
+      : "Sugar is listed under several different names, which hides the true total.";
   } else {
     const phrase = top.concern_type
       ? CONCERN_PHRASE[top.concern_type]
@@ -1427,6 +1500,137 @@ function deriveModerationAdvice(
  * from a bad one. Returns null whenever safety or compliance is null — a score
  * is never computed from incomplete data.
  */
+// ---------------------------------------------------------------------------
+// FIX 8.1 — safety and compliance, computed locally. The model's job is
+// classification only (which ingredient is banned/harmful/caution, which
+// declaration is present/missing); the arithmetic runs here so it cannot drift
+// between identical scans and cannot be nulled by an over-eager model.
+// ---------------------------------------------------------------------------
+
+/**
+ * safety_score — starts at 100 and subtracts:
+ *   banned ingredient: 40, harmful: 18, caution: 6 (each)
+ *   an additive over its FSSAI limit: 25 (each)
+ *   trans fat present above 0.2 g/100 g: 25
+ * Floored at 0. Returns null ONLY when ingredient_analysis is empty or
+ * absent — otherwise ALWAYS returns a number, however clean the label is.
+ */
+export function computeSafetyScore(
+  ingredientAnalysis: IngredientAnalysis[] | null | undefined,
+  dosageAnalysis: DosageAnalysis | null | undefined,
+  transFatAboveLimit = false,
+): number | null {
+  const ingredients = ingredientAnalysis ?? [];
+  if (ingredients.length === 0) return null;
+
+  let score = 100;
+  for (const ing of ingredients) {
+    if (ing.safety_status === "banned") score -= 40;
+    else if (ing.safety_status === "harmful") score -= 18;
+    else if (ing.safety_status === "caution") score -= 6;
+  }
+  const exceeded = (dosageAnalysis?.limit_checks ?? []).filter(
+    (c) => c.status === "exceeds_limit",
+  ).length;
+  score -= exceeded * 25;
+  if (transFatAboveLimit) score -= 25;
+
+  return Math.max(0, Math.round(score));
+}
+
+/**
+ * compliance_score — scored ONLY from declarations that can actually be
+ * assessed (status 'present', 'ok_inferred' or 'missing'). 'not_visible' /
+ * 'not_applicable' declarations are simply excluded from the denominator, so
+ * a single off-frame declaration can never zero or null the score. Returns
+ * null ONLY when fewer than 2 declarations are assessable.
+ */
+export function computeComplianceScore(
+  compliance: LegalMetrologyCompliance | null | undefined,
+): number | null {
+  const items = Object.values(compliance ?? {});
+  const assessable = items.filter(
+    (c) =>
+      c.status === "present" || c.status === "ok_inferred" || c.status === "missing",
+  );
+  if (assessable.length < 2) return null;
+  const passed = assessable.filter(
+    (c) => (c.present && c.compliant) || c.status === "ok_inferred",
+  ).length;
+  return Math.round((passed / assessable.length) * 100);
+}
+
+// ---------------------------------------------------------------------------
+// FIX 2/3 — product purpose. Governs whether nutritional scoring applies.
+// ---------------------------------------------------------------------------
+
+const SWEETENED_SIGNAL_RE =
+  /\b(sugar|glucose|fructose|dextrose|sucrose|invert sugar|invert syrup|sucralose|aspartame|acesulfame|stevia|saccharin|colour|color|flavour|flavor|essence|fruit juice|concentrate)\b/i;
+const HYDRATION_PURPOSE_RE =
+  /\b(packaged drinking water|mineral water|drinking water|soda water|carbonated water)\b/i;
+const CONDIMENT_PURPOSE_RE =
+  /\b(pickle|achaar|achar|murabba|chutney|ketchup|mayonnaise|\bjam\b|relish|salad dressing|soy sauce|hot sauce|\bsauce\b)\b/i;
+const SEASONING_PURPOSE_RE =
+  /\b(salt|namak|spice|masala|turmeric|haldi|chilli powder|chili powder|black pepper|kali mirch|\bjeera\b|cumin|dhania|coriander powder|garam masala|baking soda|vinegar|sirka|\bherbs?\b|oregano)\b/i;
+/**
+ * A compound product NAME can carry a seasoning/condiment word ("Masala
+ * Instant Noodles", "Pasta in Tomato Sauce") without the product ITSELF being
+ * a seasoning or condiment — it is the snack/meal that word merely flavours.
+ * Excludes the name-only fallback match in that case.
+ */
+const NOT_STANDALONE_SEASONING_RE =
+  /\b(noodles?|chips?|biscuits?|cereal|chocolate|candy|cookies?|wafers?|cake|bread|namkeen|curry|soup|meal|snack|drink|juice|nuggets|paratha|momos?|roll\b)\b/i;
+
+/**
+ * FIX 2 — classify the product's dietary role before nutritional scoring. The
+ * model's call is the starting point; the CRITICAL guardrail below (purpose
+ * leniency must never leak) is enforced locally so a sweetened, flavoured or
+ * coloured drink can never be scored as plain 'hydration'.
+ */
+function resolveProductPurpose(
+  model: ProductPurpose | null,
+  ctx: {
+    productName: string;
+    firstNames: string;
+    beverage: boolean;
+  },
+): { purpose: ProductPurpose; note: string | null } {
+  const hay = `${ctx.productName} ; ${ctx.firstNames}`;
+  const sweetened = SWEETENED_SIGNAL_RE.test(hay);
+
+  if (model === "hydration" && sweetened) {
+    return {
+      purpose: "beverage",
+      note: "Contains added sugar, flavour or colour — scored as a beverage, not plain hydration.",
+    };
+  }
+  if (model) return { purpose: model, note: null };
+
+  // No usable model value — derive locally. CONDIMENT / SEASONING are the
+  // product's OWN identity ("Mango Pickle", "Garam Masala"), so this matches
+  // the PRODUCT NAME ONLY — never the ingredient list. A dish that merely
+  // CONTAINS turmeric, cumin or rock salt among its ingredients (a breakfast
+  // mix, roasted makhana with a pinch of salt) is not itself "seasoning", and
+  // testing ingredient names for these two purposes proved too eager (an
+  // ingredient list of just ["Fox Nuts", "Rock Salt"] is a snack, not salt).
+  // "Masala Instant Noodles", "Pasta in Tomato Sauce" — a compound product
+  // that merely carries a seasoning/condiment WORD in its name is a
+  // snack_or_meal, not itself a seasoning or condiment.
+  const isCompoundProduct = NOT_STANDALONE_SEASONING_RE.test(ctx.productName);
+
+  if (!sweetened && HYDRATION_PURPOSE_RE.test(hay)) {
+    return { purpose: "hydration", note: null };
+  }
+  if (CONDIMENT_PURPOSE_RE.test(ctx.productName) && !isCompoundProduct) {
+    return { purpose: "condiment", note: null };
+  }
+  if (SEASONING_PURPOSE_RE.test(ctx.productName) && !ctx.beverage && !isCompoundProduct) {
+    return { purpose: "seasoning", note: null };
+  }
+  if (ctx.beverage) return { purpose: "beverage", note: null };
+  return { purpose: "snack_or_meal", note: null };
+}
+
 export function computeOverallScore(
   safety: number | null,
   nutrition: number | null,
@@ -1533,6 +1737,9 @@ export interface EnrichOptions {
  * nutritional analysis, and recompute every score locally.
  * Pure — returns a copy.
  */
+/** Categories where safety/nutrition are intentionally not the point (FIX 7.2). */
+const COMPLIANCE_ONLY_CATEGORIES = new Set(["general_merchandise", "drug_or_medical"]);
+
 export function enrichAnalysis(
   analysis: ProductAnalysis,
   opts: EnrichOptions = {},
@@ -1549,13 +1756,51 @@ export function enrichAnalysis(
       : analysis.ingredient_analysis,
   };
 
-  const nutrition = buildNutritionalAnalysis(out, category);
-  if (nutrition) {
-    // A safety score of null means no ingredients could be read at all. There
-    // is then nothing to assess nutritionally either — scoring 100 off an
-    // empty concerns list would be the exact dishonesty the partial-scan guard
-    // exists to prevent.
-    if (out.overall_assessment?.safety_score == null) {
+  // ---- FIX 2 — product purpose (food categories only) ----
+  let purpose: ProductPurpose | null = null;
+  if (isFood) {
+    const beverage = looksLikeBeverage(out);
+    const resolved = resolveProductPurpose(
+      (analysis.product_purpose as ProductPurpose | null) ?? null,
+      {
+        productName: String(out.product_info?.name ?? ""),
+        firstNames: (out.ingredient_analysis ?? [])
+          .slice(0, 3)
+          .map((i) => i.name)
+          .join(" ; "),
+        beverage,
+      },
+    );
+    purpose = resolved.purpose;
+    out.product_purpose = purpose;
+    // Canonical notes for the purposes with a scoring effect win over
+    // whatever the model wrote — these are user-facing promises, not prose.
+    out.purpose_note =
+      resolved.note ??
+      (purpose === "hydration"
+        ? "Plain water. Nutritional scoring does not apply."
+        : purpose === "seasoning"
+          ? "Used in small quantities as seasoning. Nutritional thresholds do not apply."
+          : purpose === "condiment"
+            ? "Condiments are eaten in small accompanying amounts. Judge nutrition per serving, not per 100 g."
+            : (analysis.purpose_note ?? null));
+  } else {
+    delete out.product_purpose;
+    delete out.purpose_note;
+  }
+  // 'hydration' / 'seasoning' — nutritional scoring simply does not apply.
+  const purposeHasNoNutrition = purpose === "hydration" || purpose === "seasoning";
+
+  const nutrition = buildNutritionalAnalysis(out, category, purpose);
+  // A genuinely unreadable ingredient list means there is nothing to assess
+  // nutritionally either — scoring 100 off an empty concerns list would be
+  // the exact dishonesty the partial-scan guard exists to prevent. This is
+  // now the deterministic ingredient_analysis.length check, not a re-read of
+  // the model's (advisory, sometimes wrongly-null) safety_score.
+  const noIngredientsReadable = (out.ingredient_analysis?.length ?? 0) === 0;
+
+  if (nutrition && !purposeHasNoNutrition) {
+    if (noIngredientsReadable) {
       nutrition.nutrition_score = null;
       nutrition.nutrition_data_complete = false;
       nutrition.primary_concern = null;
@@ -1565,7 +1810,10 @@ export function enrichAnalysis(
     out.nutritional_analysis = nutrition;
     recordTransFatViolation(out, nutrition);
   } else {
-    // Non-food: the field is omitted entirely, never returned as an empty shell.
+    // Non-food, or a purpose (hydration/seasoning) that has no nutrition
+    // dimension: the field is omitted entirely, never returned as an empty
+    // shell — this is also what drops the results screen to two chips
+    // instead of three.
     delete out.nutritional_analysis;
   }
 
@@ -1575,19 +1823,52 @@ export function enrichAnalysis(
     summary: "",
     recommendation: "",
   };
-  const nutritionScore = nutrition?.nutrition_score ?? null;
-  const overall = computeOverallScore(
-    oa.safety_score ?? null,
-    nutritionScore,
-    oa.compliance_score ?? null,
-    isFood,
+
+  // ---- FIX 8.1 — safety_score and compliance_score, computed locally. The
+  // model's raw scores are advisory only and are IGNORED whenever a computed
+  // value exists; only the "genuinely nothing to score" case falls back to
+  // whatever the model/normalizer produced (which will itself be null). ----
+  const transFatFlag = nutrition?.threshold_flags.find((f) => /trans/i.test(f.nutrient));
+  const transFatAboveLimit =
+    transFatFlag != null &&
+    transFatFlag.value_per_100 > NUTRITIONAL_THRESHOLDS.trans_fat.bands[0].above;
+  const computedSafety = computeSafetyScore(
+    out.ingredient_analysis,
+    out.dosage_analysis,
+    transFatAboveLimit,
   );
+  const computedCompliance = computeComplianceScore(out.legal_metrology_compliance);
+
+  // drug_or_medical: "NEVER tell a user a medicine is safe or unsafe to use" —
+  // safety is intentionally never scored, regardless of what was extracted.
+  const safetyScore = category === "drug_or_medical" ? null : computedSafety;
+  const complianceScore = computedCompliance;
 
   out.overall_assessment = {
     ...oa,
+    safety_score: safetyScore,
+    safety_status: safetyScore == null ? "insufficient_data" : "ok",
+    compliance_score: complianceScore,
+    compliance_status: complianceScore == null ? "insufficient_data" : "ok",
+  };
+
+  const nutritionScore = out.nutritional_analysis?.nutrition_score ?? null;
+  const nutritionApplies = out.nutritional_analysis != null;
+
+  // general_merchandise / drug_or_medical: FIX 7.2 — these categories check
+  // labelling compliance only. overall_score is just the compliance score,
+  // never a blend that would imply a safety or nutrition verdict that was
+  // never computed.
+  const overall = COMPLIANCE_ONLY_CATEGORIES.has(category)
+    ? complianceScore
+    : computeOverallScore(safetyScore, nutritionScore, complianceScore, nutritionApplies);
+
+  out.overall_assessment = {
+    ...out.overall_assessment,
     nutrition_score: nutritionScore,
     overall_score: overall,
   };
+
   const nFinal = out.nutritional_analysis ?? null;
   const veryHighThreshold =
     nFinal?.threshold_flags.some((f) => f.level === "very_high") ?? false;
@@ -1601,17 +1882,35 @@ export function enrichAnalysis(
         ].join(" ; "),
       ));
 
-  out.verdict = deriveVerdict(
-    oa.safety_score ?? null,
-    nutritionScore,
-    overall,
-    isFood,
-    out.verdict,
-    nFinal?.food_type ?? "processed_product",
-    { veryHighThreshold, useSparingly },
-  );
+  out.verdict = COMPLIANCE_ONLY_CATEGORIES.has(category)
+    ? deriveComplianceOnlyVerdict(overall, out.verdict)
+    : deriveVerdict(
+        safetyScore,
+        nutritionScore,
+        overall,
+        nutritionApplies,
+        out.verdict,
+        nFinal?.food_type ?? "processed_product",
+        { veryHighThreshold, useSparingly },
+      );
 
   return out;
+}
+
+/**
+ * FIX 7.2 — general_merchandise / drug_or_medical verdict bands: good
+ * "Compliant" | caution "Minor compliance issues" | avoid "Significant
+ * compliance violations" — there is no 'limit' band; nothing here is judged
+ * on nutrition or a safety verdict, only compliance.
+ */
+function deriveComplianceOnlyVerdict(
+  overall: number | null,
+  fallback: Verdict,
+): Verdict {
+  if (overall == null) return fallback;
+  if (overall >= 85) return "safe";
+  if (overall >= 60) return "caution";
+  return "avoid";
 }
 
 // ---------------------------------------------------------------------------

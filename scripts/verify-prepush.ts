@@ -471,10 +471,18 @@ check("category = personal_care", A.detected_category.category === "personal_car
 check("SLES rated 'caution' NOT 'harmful'", sles.safety_status === "caution", sles.safety_status);
 check("nutritional_analysis ABSENT", A.nutritional_analysis === undefined);
 check("nutrition_score null", (A.overall_assessment.nutrition_score ?? null) === null);
+// FIX 8.1 — safety_score and compliance_score are now computed LOCALLY from
+// ingredient_analysis / legal_metrology_compliance; the raw 82/90 the fixture
+// set on overall_assessment is advisory only and correctly ignored. Check the
+// formula against what was ACTUALLY computed, not the old fixture numbers.
 check(
-  "overall = safety*0.75 + compliance*0.25 (non-food formula)",
-  A.overall_assessment.overall_score === Math.round(82 * 0.75 + 90 * 0.25),
-  `got ${A.overall_assessment.overall_score}, expected ${Math.round(82 * 0.75 + 90 * 0.25)}`,
+  "overall = safety*0.75 + compliance*0.25 (non-food formula), using the LOCALLY COMPUTED scores",
+  A.overall_assessment.overall_score ===
+    Math.round(
+      (A.overall_assessment.safety_score ?? 0) * 0.75 +
+        (A.overall_assessment.compliance_score ?? 0) * 0.25,
+    ),
+  `safety=${A.overall_assessment.safety_score} compliance=${A.overall_assessment.compliance_score} overall=${A.overall_assessment.overall_score}`,
 );
 check(
   "complaint portal = CDSCO",
@@ -552,8 +560,21 @@ check(
   "unknown category falls back to the FOOD reference (broadest)",
   !!buildCompactReference("unknown").nutritional_concerns?.length,
 );
-check("null safety -> insufficient_data", C.overall_assessment.safety_status === "insufficient_data");
-check("null safety -> overall_score null", C.overall_assessment.overall_score === null);
+// FIX 8.1/8.2 — this fixture carries ONE real (if unclassifiable) ingredient,
+// so it is no longer "insufficient" — that was the exact bug (a model that
+// fires null on data it could actually score). safety_score is computed
+// locally (100 here — "unknown" carries no penalty) and compliance_score from
+// the fixture's default declaration set (10/11 assessable declarations pass).
+check(
+  "a scan with a real ingredient is scored, not nulled (FIX 8)",
+  C.overall_assessment.safety_status === "ok" && C.overall_assessment.safety_score === 100,
+  `status=${C.overall_assessment.safety_status} score=${C.overall_assessment.safety_score}`,
+);
+check(
+  "compliance is scored from the fixture's default declarations, not nulled",
+  C.overall_assessment.compliance_status === "ok" && C.overall_assessment.compliance_score != null,
+  `status=${C.overall_assessment.compliance_status} score=${C.overall_assessment.compliance_score}`,
+);
 check("product name stays null (no guess)", C.product_info.name === null);
 console.log(
   `    NOTE: router 'confidence' is set by the Haiku call, and the correction dropdown is a
@@ -610,10 +631,20 @@ check(
   sodiumFlagD.level === "medium",
   `90 mg -> ${sodiumFlagD.level} (adult 'medium' starts at 120 mg)`,
 );
+// FIX 8.1 — safety_score is now computed LOCALLY (100 - 18 for the one
+// 'harmful' Tartrazine - 6x2 for the two 'caution' ingredients = 70), not
+// read from the fixture's raw 45. 70 is >= 50, so this does NOT force
+// 'avoid' by itself — the harmful ingredient still cost 30 real points, and
+// the verdict correctly follows the nutrition banding instead (45 -> 'limit').
 check(
-  "artificial colour kept 'harmful' -> safety 45 (<50) forces verdict 'avoid'",
-  D.verdict === "avoid",
-  `verdict=${D.verdict} safety=${D.overall_assessment.safety_score}`,
+  "harmful ingredient costs real safety points, computed locally (100-18-6-6=70)",
+  D.overall_assessment.safety_score === 70,
+  `safety=${D.overall_assessment.safety_score}`,
+);
+check(
+  "safety 70 (>=50) + nutrition 45 ('limit' band) -> verdict 'limit', not forced 'avoid'",
+  D.verdict === "limit",
+  `verdict=${D.verdict} safety=${D.overall_assessment.safety_score} nutrition=${D.overall_assessment.nutrition_score}`,
 );
 check(
   "baby_threshold_multiplier is 0.5",
@@ -1136,12 +1167,21 @@ check(
   liar2Out.nutritional_analysis!.nutrition_score! >= NUTRITIONAL_THRESHOLDS.score_floor,
   `got ${liar2Out.nutritional_analysis!.nutrition_score}, floor ${NUTRITIONAL_THRESHOLDS.score_floor}`,
 );
+// FIX 8.1 — safety_score and compliance_score in the blend are now the
+// LOCALLY COMPUTED values (from ingredient_analysis / legal_metrology_compliance),
+// not the fixture's raw 92/88 — check the formula self-consistently against
+// what was actually computed.
+const gOut = run(cases.find((c) => c.id === "G")!.r, "food_and_beverages");
 check(
-  "overall_score is recomputed as the weighted blend",
+  "overall_score is recomputed as the weighted blend, using the LOCALLY COMPUTED safety/compliance",
   byId.G.score != null &&
-    run(cases.find((c) => c.id === "G")!.r, "food_and_beverages").overall_assessment
-      .overall_score === Math.round(92 * 0.35 + byId.G.score! * 0.5 + 88 * 0.15),
-  `expected ${Math.round(92 * 0.35 + byId.G.score! * 0.5 + 88 * 0.15)}`,
+    gOut.overall_assessment.overall_score ===
+      Math.round(
+        (gOut.overall_assessment.safety_score ?? 0) * 0.35 +
+          byId.G.score! * 0.5 +
+          (gOut.overall_assessment.compliance_score ?? 0) * 0.15,
+      ),
+  `safety=${gOut.overall_assessment.safety_score} nutrition=${byId.G.score} compliance=${gOut.overall_assessment.compliance_score} overall=${gOut.overall_assessment.overall_score}`,
 );
 
 // ===========================================================================
@@ -1194,9 +1234,12 @@ for (const k of [
   lmcNv[k] = { present: false, value: null, compliant: false, issue: null, status: "not_visible" };
 }
 const nvOut = run(nv, "food_and_beverages");
+// FIX 8.1 — compliance_score is now computed LOCALLY from the 5 assessable
+// declarations (all present+compliant here), not read from the fixture's raw
+// 85 — 5/5 assessable pass = 100, not the old advisory number.
 check(
   "6 not_visible + 5 assessable -> compliance STILL scored (was the bug: this used to null)",
-  nvOut.overall_assessment.compliance_score === 85 &&
+  nvOut.overall_assessment.compliance_score === 100 &&
     nvOut.overall_assessment.compliance_status === "ok",
   `score=${nvOut.overall_assessment.compliance_score} status=${nvOut.overall_assessment.compliance_status}`,
 );
@@ -1249,9 +1292,13 @@ for (const k of Object.keys(lmcMiss)) {
 }
 lmcMiss.mrp = { present: false, value: null, compliant: false, issue: "Genuinely absent from a legible label", status: "missing" };
 lmcMiss.net_quantity = { present: false, value: null, compliant: false, issue: "Genuinely absent", status: "missing" };
+// FIX 8.1 — computed locally: 2 assessable declarations, both genuinely
+// 'missing' (non-compliant) -> 0/2 pass = 0. Still SCORED (not null) because
+// "missing" is assessable — it just scores badly, which is honest.
 check(
-  "2 'missing' (legible label, declaration truly absent) -> compliance scored, non-insufficient",
-  run(miss, "food_and_beverages").overall_assessment.compliance_score === 60,
+  "2 'missing' (legible label, declaration truly absent) -> compliance scored (0), non-insufficient",
+  run(miss, "food_and_beverages").overall_assessment.compliance_score === 0 &&
+    run(miss, "food_and_beverages").overall_assessment.compliance_status === "ok",
 );
 check(
   "5.10 illegible product name stays null, not a guess",
@@ -1294,9 +1341,12 @@ hr("COUNTRY OF ORIGIN — 'ok_inferred' status");
   check("normalize forces compliant:true for ok_inferred (model sent false)", coi.compliant === true);
   check("note is preserved", !!coi.note && /Manufacturer address/i.test(coi.note ?? ""));
   check("value is preserved", coi.value === "India (inferred from manufacturer address)");
+  // FIX 8.1 — computed locally: the fixture's default 11 declarations (10
+  // present+compliant, 1 missing) with country_of_origin as ok_inferred
+  // (assessable + counts as passed) -> 10/11 = 91, not the old raw 90.
   check(
     "ok_inferred is assessable -> compliance still scored, not insufficient",
-    inferred.overall_assessment.compliance_score === 90 &&
+    inferred.overall_assessment.compliance_score === 91 &&
       inferred.overall_assessment.compliance_status === "ok",
     `score=${inferred.overall_assessment.compliance_score}`,
   );

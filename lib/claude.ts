@@ -30,6 +30,9 @@ export async function askClaude(
   const message = await anthropic.messages.create({
     model: CLAUDE_MODEL,
     max_tokens: 1024,
+    // FIX 9.1 — NOTE: `temperature` is deprecated/rejected (400) on
+    // claude-sonnet-5 (CLAUDE_MODEL) — verified live against the real API.
+    // Not settable here.
     ...(system ? { system } : {}),
     messages: [{ role: "user", content: prompt }],
   });

@@ -29,8 +29,24 @@ const SUPPORTED_MEDIA_TYPES: readonly VisionMediaType[] = [
 /** ~5 MB decoded is Anthropic's per-image cap; base64 inflates it by ~4/3. */
 const MAX_BASE64_CHARS = 7_000_000;
 
-const SYSTEM_PROMPT =
-  "Extract ALL text visible on this product package. Return the raw text exactly as printed, preserving layout. Include ingredients, MRP, dates, manufacturer info, FSSAI number, nutritional info, everything. The text in this image may be rotated, curved around a cylindrical package, printed on crinkled foil, or partially obscured. Read it in whatever orientation it appears. If part of the label is cut off or unreadable, extract everything you can and note which sections were unreadable. Return ONLY the extracted text, nothing else.";
+// FIX 1.1 — this tier had been narrating the photo ("Based on the image, this
+// appears to be an eye drop bottle...") instead of transcribing the label,
+// which then passed the structural-marker check by accident while containing
+// no real label data. This prompt is deliberately blunt about it.
+const SYSTEM_PROMPT = `You are an OCR transcription engine. Output ONLY the text printed on the package, exactly as printed.
+
+STRICT RULES:
+- Do NOT describe the image, packaging, lighting or photo quality
+- Do NOT write "Based on the image", "This appears to be", "I can make out", or any similar framing
+- Do NOT invent headings, add commentary, or interpret
+- Do NOT summarise. Transcribe.
+- Preserve the label's own structure and line breaks
+- Where text is genuinely unreadable, write [unreadable] inline at that position and continue. Do not explain why.
+- If you can read nothing at all, output exactly: NO_TEXT_FOUND
+
+Text may be rotated, curved around a cylinder, on crinkled foil, or in very small type. Read it in whatever orientation it appears. Work systematically across the whole label including the smallest print.
+
+Output the transcription and nothing else.`;
 
 function jsonError(
   message: string,
@@ -86,6 +102,9 @@ export async function POST(request: Request) {
     const message = await anthropic.messages.create({
       model: HAIKU_MODEL,
       max_tokens: 2000,
+      // FIX 9.1 — a transcription tier must read the same image the same way
+      // every time; temperature 0 removes random sampling from the read.
+      temperature: 0,
       // This tier only transcribes the label — no reasoning to do. Haiku 4.5
       // does not think by default, but state it explicitly so a future model
       // swap cannot start spending this 2,000-token budget on thinking.

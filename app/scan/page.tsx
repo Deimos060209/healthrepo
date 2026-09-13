@@ -38,15 +38,18 @@ import {
   processImage,
   validateExtractedText,
   imageToVisionPayload,
+  looksLikeNarration,
   OcrError,
   ocrErrorMessage,
 } from "@/lib/ocr";
 import { supabase } from "@/lib/supabase";
 import { uploadProductImage } from "@/lib/storage";
 import { HEALTHIER_ALTERNATIVES } from "@/lib/reference-data";
+import { SAFE_PRODUCT_NUTRITION_FLOOR } from "@/lib/safe-products";
 import {
   resolveCategory,
   SELECTABLE_CATEGORIES,
+  verdictLabel,
 } from "@/lib/product-category";
 import {
   fetchHealthProfile,
@@ -65,7 +68,6 @@ import type {
   Verdict,
 } from "@/types/analysis";
 import { NutritionSection } from "@/components/NutritionSection";
-import { isFoodCategory } from "@/lib/enrich-analysis";
 
 // ---------------------------------------------------------------------------
 // Local helpers
@@ -477,22 +479,26 @@ const isNotApplicable = (item: ComplianceItem) =>
   (!item.present && item.compliant && /not applicable/i.test(item.issue ?? ""));
 
 /**
- * The full-screen "Partial scan — we could only read part of this label"
- * takeover is ONLY for a scan with nothing worth showing: safety could not be
- * scored because no ingredients were readable.
+ * FIX 8.4 — the full-screen "Partial scan" takeover is now genuinely rare: it
+ * fires ONLY when there is nothing at all worth showing — BOTH safety and
+ * compliance came back null AND the photo barely had any label text AND the
+ * model itself said there was no label content to read. Any scan that
+ * produced a real score on even ONE dimension is a useful scan and is shown
+ * normally, with an inline note for whichever side is missing (rendered by
+ * the results screen itself, not this gate).
  *
- * An incomplete COMPLIANCE side is NOT this case. A normal single-panel photo
- * legitimately doesn't show the MRP, net quantity or dates — the safety and
- * nutrition analysis is still complete and useful, so the results screen is
- * shown and the compliance section renders its own "couldn't verify every
- * declaration" state. (Gating the whole screen on compliance was the cause of
- * every scan showing "partial".)
+ * This replaces the old "safety_score == null" gate, which fired every time
+ * the model's own (over-eager) anti-hallucination instinct nulled a score on
+ * a perfectly readable label — the exact bug this fix corrects.
  */
-function isInsufficientData(a: ProductAnalysis): boolean {
+function isInsufficientData(a: ProductAnalysis, extractedTextLength: number): boolean {
   const oa = a.overall_assessment;
-  return (
-    !oa || oa.safety_score == null || oa.safety_status === "insufficient_data"
-  );
+  const bothNull = !oa || (oa.safety_score == null && oa.compliance_score == null);
+  if (!bothNull) return false;
+  // A ProductAnalysis reaching this screen was already routed as a real
+  // package (not_a_packaged_product is caught earlier, as a 422); the only
+  // remaining "nothing to show" signal is the model's own early_verdict.
+  return extractedTextLength < 150 && a.early_verdict === "no_label_content";
 }
 
 function deriveComplianceStatus(
@@ -862,7 +868,7 @@ export default function ScanPage() {
               message:
                 typeof data.message === "string" && data.message.trim()
                   ? data.message
-                  : "We couldn't find any product label in this photo.",
+                  : "We couldn't find any retail packaging or printed label in this photo. HealthRepo analyses packaged products using the information printed on the pack.",
             });
             setSteps((s) => ({ ...s, analyze: "done" }));
             setView("notpackaged");
@@ -926,7 +932,7 @@ export default function ScanPage() {
 
       // A partial scan has no honest score — keep it out of history and the
       // safe-products database entirely.
-      if (file && !isInsufficientData(analysis)) {
+      if (file && !isInsufficientData(analysis, sourceText.length)) {
         void saveScan(analysis, sourceText, file);
       }
     },
@@ -1104,9 +1110,20 @@ export default function ScanPage() {
         return;
       }
 
+      // FIX 1.2 — narration check runs BEFORE validateExtractedText: narration
+      // often mentions words like "ingredients" or "MRP" while transcribing
+      // nothing real, which lets it pass the structural-marker check by
+      // accident. A narrating tier is treated as FAILED and escalated.
+      const haikuNarrated = haikuText ? looksLikeNarration(haikuText) : false;
+      if (haikuNarrated) {
+        console.warn("[ocr] tier2 haiku NARRATED instead of transcribing — escalating", {
+          preview: haikuText.slice(0, 200),
+        });
+      }
+
       // Vision output is trusted at a LOWER bar than Tesseract (>= 2, not 3).
       const haikuScore = haikuText ? validateExtractedText(haikuText).score : 0;
-      if (haikuText && haikuScore >= 2) {
+      if (haikuText && haikuScore >= 2 && !haikuNarrated) {
         console.info("[ocr] accepted tier2 haiku (score", haikuScore, ")");
         setSteps((s) => ({ ...s, enhance: "done" }));
         await analyzeText(haikuText, "haiku");
@@ -1116,9 +1133,15 @@ export default function ScanPage() {
       // ---- TIER 3: Sonnet Vision (advanced) ----
       setSteps((s) => ({ ...s, enhance: "done", advanced: "active" }));
 
-      let sonnetText = "";
-      let sonnetUnreadable: string[] = [];
-      if (payload) {
+      // FIX 1.2 — one fetch, callable twice: once plain, once with the
+      // "you narrated instead of transcribing" retry hint.
+      async function fetchSonnetVision(
+        retryHint?: string,
+      ): Promise<{ text: string; unreadable: string[] }> {
+        if (!payload) {
+          console.warn("[ocr] tier3 sonnet skipped — no image payload");
+          return { text: "", unreadable: [] };
+        }
         attempted.sonnet = true;
         const ctrl = new AbortController();
         const t = setTimeout(() => ctrl.abort(), 55_000);
@@ -1129,6 +1152,7 @@ export default function ScanPage() {
             body: JSON.stringify({
               imageBase64: payload.base64,
               mediaType: payload.mediaType,
+              ...(retryHint ? { retryHint } : {}),
             }),
             signal: ctrl.signal,
           });
@@ -1136,42 +1160,76 @@ export default function ScanPage() {
           console.info("[ocr] tier3 sonnet:", {
             status: res.status,
             ok: res.ok,
+            retry: Boolean(retryHint),
             chars:
               typeof data?.extractedText === "string"
                 ? data.extractedText.length
                 : 0,
           });
           if (res.ok && typeof data.extractedText === "string") {
-            sonnetText = data.extractedText.trim();
-          } else if (
-            data?.error === "out_of_credits" ||
-            data?.error === "auth_error"
-          ) {
+            return {
+              text: data.extractedText.trim(),
+              unreadable: Array.isArray(data?.unreadableFields)
+                ? data.unreadableFields
+                    .filter((x: unknown): x is string => typeof x === "string")
+                    .map((x: string) => x.trim())
+                    .filter(Boolean)
+                : [],
+            };
+          }
+          if (data?.error === "out_of_credits" || data?.error === "auth_error") {
             hardOutage = mapAnalysisError(data);
           }
-          if (Array.isArray(data?.unreadableFields)) {
-            sonnetUnreadable = data.unreadableFields
-              .filter((x: unknown): x is string => typeof x === "string")
-              .map((x: string) => x.trim())
-              .filter(Boolean);
-          }
+          return { text: "", unreadable: [] };
         } catch (err) {
           console.warn("[ocr] tier3 sonnet threw / timed out:", err);
+          return { text: "", unreadable: [] };
         } finally {
           clearTimeout(t);
         }
-      } else {
-        console.warn("[ocr] tier3 sonnet skipped — no image payload");
       }
+
+      let { text: sonnetText, unreadable: sonnetUnreadable } =
+        await fetchSonnetVision();
+
+      // FIX 1.2 — narration check BEFORE validateExtractedText, same as tier 2.
+      // Every narration event is logged; if Sonnet vision narrates, retry it
+      // ONCE with an explicit "stop describing" prefix.
+      if (sonnetText && looksLikeNarration(sonnetText)) {
+        console.warn("[ocr] tier3 sonnet NARRATED instead of transcribing — retrying once", {
+          preview: sonnetText.slice(0, 200),
+        });
+        const retry = await fetchSonnetVision(
+          "Your previous response contained description instead of transcription. Output ONLY the literal printed text. No commentary.",
+        );
+        if (retry.text && looksLikeNarration(retry.text)) {
+          console.warn("[ocr] tier3 sonnet NARRATED again after retry", {
+            preview: retry.text.slice(0, 200),
+          });
+        }
+        // Use the retry's output even if it narrated again — it is still the
+        // best (and last) thing this tier produced; the narration check below
+        // decides whether it is usable.
+        if (retry.text) {
+          sonnetText = retry.text;
+          sonnetUnreadable = retry.unreadable;
+        }
+      }
+      const sonnetNarrated = sonnetText ? looksLikeNarration(sonnetText) : false;
 
       setSteps((s) => ({ ...s, advanced: "done" }));
 
       // Sonnet is the last reader: accept at the lower vision bar, and accept
-      // ANY substantial text it returned rather than dead-ending.
+      // ANY substantial text it returned rather than dead-ending — UNLESS it
+      // is narration, which is never usable label data.
       const sonnetScore = sonnetText
         ? validateExtractedText(sonnetText).score
         : 0;
-      if (sonnetText && (sonnetScore >= 2 || sonnetText.length >= 24)) {
+      if (
+        sonnetText &&
+        !sonnetNarrated &&
+        (sonnetScore >= 2 || sonnetText.length >= 24)
+      ) {
         console.info(
           "[ocr] accepted tier3 sonnet (score",
           sonnetScore,
@@ -1194,11 +1252,11 @@ export default function ScanPage() {
       // Salvage: fall back to the best text an earlier tier produced before
       // giving up. Vision text clears the >= 2 bar; Tesseract still needs >= 2.
       const salvage: { text: string; tier: Tier } | null =
-        haikuText && haikuScore >= 2
+        haikuText && haikuScore >= 2 && !haikuNarrated
           ? { text: haikuText, tier: "haiku" }
           : tesseractText.trim() && tesseractScore >= 2
             ? { text: tesseractText, tier: "tesseract" }
-            : haikuText.length >= 40
+            : haikuText.length >= 40 && !haikuNarrated
               ? { text: haikuText, tier: "haiku" }
               : null;
       if (salvage) {
@@ -1453,7 +1511,7 @@ export default function ScanPage() {
       setShowTextPanel(false);
 
       // Keep the saved row / safe-products state consistent.
-      if (isInsufficientData(analysis)) {
+      if (isInsufficientData(analysis, text.length)) {
         // a partial scan is never stored — nothing to sync
       } else if (save.state === "saved" && save.id) {
         const pi =
@@ -1498,7 +1556,7 @@ export default function ScanPage() {
     for (const ing of ingredients) {
       counts[ing.safety_status] = (counts[ing.safety_status] ?? 0) + 1;
     }
-    const insufficient = isInsufficientData(a);
+    const insufficient = isInsufficientData(a, result.extractedText.length);
     const compliance = deriveComplianceStatus(a);
     const complianceIssues = Object.entries(a.legal_metrology_compliance ?? {})
       .filter(
@@ -2223,6 +2281,18 @@ export default function ScanPage() {
             </p>
           )}
 
+          {/* FIX 7.2 — the medicine notice, above everything else, whenever this
+              is a drug_or_medical scan. HealthRepo checks labelling
+              compliance only and never gives a safety verdict on a medicine. */}
+          {derived.a.detected_category?.category === "drug_or_medical" && (
+            <p className="flex items-start gap-2 rounded-2xl border-2 border-purple-500/50 bg-purple-500/[0.08] p-4 text-sm font-semibold text-purple-900 dark:text-purple-200">
+              <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0" aria-hidden />
+              This is a medicinal product. HealthRepo checks labelling
+              compliance only. Consult a pharmacist or doctor about whether
+              this medicine is right for you.
+            </p>
+          )}
+
           {/* a-1) Detected product category + which rules were applied */}
           <CategoryBanner
             analysis={derived.a}
@@ -2240,26 +2310,13 @@ export default function ScanPage() {
             onReanalyze={reanalyzeWithCategory}
           />
 
-          {/* a0) Did this scan make it into the verified safe-products list? */}
-          {!derived.insufficient &&
-            save.state === "saved" &&
-            (clampScore(derived.a.overall_assessment?.safety_score) >= 75 ? (
-              <p className="flex items-start gap-2 rounded-xl border border-green-500/40 bg-green-500/10 px-3 py-2 text-sm text-green-800 dark:text-green-200">
-                <Sparkles className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-                <span>
-                  🌟 This product has been added to our safe products database!
-                  Other users can now discover it.
-                </span>
-              </p>
-            ) : (
-              <p className="flex items-start gap-2 rounded-xl bg-zinc-500/10 px-3 py-2 text-sm text-zinc-600 dark:text-zinc-400">
-                <Circle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
-                <span>
-                  This product didn&rsquo;t meet our safety threshold (75+). It
-                  won&rsquo;t appear in safe product recommendations.
-                </span>
-              </p>
-            ))}
+          {/* a0) BUG 4 — did this scan ACTUALLY make it into the verified
+              safe-products list? This must match the real filter the
+              search_safe_products / verified_safe_products view applies —
+              never claim inclusion the product does not qualify for. */}
+          {!derived.insufficient && save.state === "saved" && (
+            <SafeProductsNote a={derived.a} />
+          )}
 
           {/* a) Product header + gauge — OR the partial-scan notice */}
           {derived.insufficient ? (
@@ -2302,6 +2359,50 @@ export default function ScanPage() {
           <>
           {/* 1) VERDICT CARD */}
           <VerdictCard a={derived.a} save={save} />
+
+          {/* BUG 2 — why nutrition doesn't apply (hydration/seasoning), or a
+              purpose classification worth surfacing. */}
+          {derived.a.purpose_note && (
+            <p className="flex items-center gap-2 rounded-xl bg-teal-500/10 px-3 py-2 text-xs text-teal-800 dark:text-teal-200">
+              <Info className="h-4 w-4 shrink-0" aria-hidden />
+              {derived.a.purpose_note}
+            </p>
+          )}
+
+          {/* FIX 8.4 — a scan that scored ONE dimension but not the other is
+              still a useful scan; say plainly what is missing instead of
+              silently showing a blank/"?" tile. */}
+          {derived.a.overall_assessment?.safety_score == null &&
+            derived.a.overall_assessment?.compliance_score != null && (
+              <p className="flex items-center gap-2 rounded-xl bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+                <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
+                Ingredients weren&rsquo;t visible in this photo, so safety
+                couldn&rsquo;t be scored — compliance is shown from what was
+                readable.
+                <button
+                  type="button"
+                  onClick={reset}
+                  className="ml-auto shrink-0 whitespace-nowrap rounded-lg bg-amber-600 px-2.5 py-1 text-xs font-semibold text-white"
+                >
+                  Scan ingredients panel
+                </button>
+              </p>
+            )}
+          {derived.a.overall_assessment?.compliance_score == null &&
+            derived.a.overall_assessment?.safety_score != null && (
+              <p className="flex items-center gap-2 rounded-xl bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+                <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden />
+                Too few declarations were visible to score compliance — safety
+                is shown from the ingredients that were readable.
+                <button
+                  type="button"
+                  onClick={reset}
+                  className="ml-auto shrink-0 whitespace-nowrap rounded-lg bg-amber-600 px-2.5 py-1 text-xs font-semibold text-white"
+                >
+                  Scan full label
+                </button>
+              </p>
+            )}
 
           {/* 2) What you should know */}
           {derived.keyFindings.length > 0 && (
@@ -3218,7 +3319,11 @@ function verdictDisplay(
 function ScoreStrip({ a }: { a: ProductAnalysis }) {
   const [open, setOpen] = useState<string | null>(null);
   const oa = a.overall_assessment;
-  const isFood = isFoodCategory(a.detected_category?.category);
+  // BUG 2 — a nutrition dimension is shown ONLY when one was actually
+  // computed. It is omitted entirely (not merely null) for non-food
+  // categories AND for a food product whose purpose is 'hydration' or
+  // 'seasoning' (plain water, salt, spices) — those get two chips, not three.
+  const isFood = a.nutritional_analysis != null;
 
   const tiles: {
     key: string;
@@ -3319,11 +3424,62 @@ function ScoreStrip({ a }: { a: ProductAnalysis }) {
   );
 }
 
+/**
+ * BUG 4 — the safe-products inclusion message, conditional on the ACTUAL
+ * filter the DB view applies (migration 20260909040000 / search_safe_products):
+ *   overall_score >= 75 AND compliant AND (nutrition_score >= 60 OR null)
+ * A product that does not qualify is told plainly WHY, never given a false
+ * "will be saved" claim.
+ */
+function SafeProductsNote({ a }: { a: ProductAnalysis }) {
+  const oa = a.overall_assessment;
+  const overall = oa?.overall_score ?? null;
+  const nutrition = oa?.nutrition_score ?? null;
+  const compliant = deriveComplianceStatus(a) === "compliant";
+  const qualifies =
+    overall != null &&
+    overall >= 75 &&
+    compliant &&
+    (nutrition == null || nutrition >= SAFE_PRODUCT_NUTRITION_FLOOR);
+
+  if (qualifies) {
+    return (
+      <p className="flex items-start gap-2 rounded-xl border border-green-500/40 bg-green-500/10 px-3 py-2 text-sm text-green-800 dark:text-green-200">
+        <Sparkles className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+        <span>
+          🌟 This product has been added to our safe products database! Other
+          users can now discover it.
+        </span>
+      </p>
+    );
+  }
+
+  let reason: string;
+  if (nutrition != null && nutrition < SAFE_PRODUCT_NUTRITION_FLOOR) {
+    reason = `Not added to safe products — nutrition score is below our threshold of ${SAFE_PRODUCT_NUTRITION_FLOOR}.`;
+  } else if (!compliant) {
+    reason = "Not added to safe products — this product has compliance violations.";
+  } else if (overall == null || overall < 75) {
+    reason = "Not added to safe products — overall score is below 75.";
+  } else {
+    reason = "Not added to safe products.";
+  }
+
+  return (
+    <p className="flex items-start gap-2 rounded-xl bg-zinc-500/10 px-3 py-2 text-sm text-zinc-600 dark:text-zinc-400">
+      <Circle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden />
+      <span>{reason}</span>
+    </p>
+  );
+}
+
 /** The top-of-results verdict card: big call, one-line reason, three scores. */
 function VerdictCard({ a, save }: { a: ProductAnalysis; save: SaveState }) {
   const m = VERDICT_META[a.verdict] ?? VERDICT_META.caution;
   const foodWording = verdictDisplay(a);
-  const label = foodWording?.label ?? m.label;
+  // FIX 6 — category-appropriate wording ("Safe to use", never "Safe to
+  // consume", for a non-food product; the medicine notice for drug_or_medical).
+  const label = foodWording?.label ?? verdictLabel(a.verdict, a.detected_category?.category);
   const subline = foodWording?.subline ?? VERDICT_SUBLINE[a.verdict];
   return (
     <section className={`flex flex-col gap-3 rounded-2xl border-2 p-5 ${m.card}`}>

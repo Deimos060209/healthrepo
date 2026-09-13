@@ -15,6 +15,7 @@ import { HEALTHIER_ALTERNATIVES } from "@/lib/reference-data";
 import {
   resolveCategory,
   ingredientRiskPhrase,
+  verdictLabel,
 } from "@/lib/product-category";
 import type {
   ProductAnalysis,
@@ -316,14 +317,7 @@ function scoreBand(score: number): { word: string; rgb: RGB } {
   return { word: "Unsafe", rgb: RED };
 }
 
-function recommendationText(score: number): string {
-  const s = clamp(score);
-  if (s >= 80) return "SAFE TO CONSUME";
-  if (s >= 50) return "CONSUME WITH CAUTION";
-  return "AVOID THIS PRODUCT";
-}
-
-/** The big banner line, keyed off the verdict rather than the safety score. */
+/** The big banner line, keyed off the verdict rather than the safety score — v.text is legacy/unused since FIX 6, v.rgb still used for colour. */
 const VERDICT_TEXT: Record<Verdict, { text: string; rgb: RGB }> = {
   safe: { text: "SAFE TO CONSUME", rgb: GREEN },
   caution: { text: "CONSUME WITH CAUTION", rgb: AMBER },
@@ -1432,10 +1426,16 @@ function drawOverall(R: Layout, a: ProductAnalysis) {
       // 'safe' spans nutrition 66-95: 66-75 is "REASONABLE CHOICE", 76+ "GOOD".
       R.bigVerdict(nScore <= 75 ? "REASONABLE CHOICE" : "GOOD CHOICE", GREEN);
     } else if (v) {
-      R.bigVerdict(v.text, v.rgb);
+      // FIX 6 — category-appropriate wording ("Safe to use", never "Safe to
+      // consume", for a non-food product; the medicine notice for
+      // drug_or_medical). v.rgb still carries the right colour for the verdict.
+      R.bigVerdict(verdictLabel(a.verdict, a.detected_category?.category).toUpperCase(), v.rgb);
     } else {
       const band = scoreBand(oa.safety_score as number);
-      R.bigVerdict(recommendationText(oa.safety_score as number), band.rgb);
+      R.bigVerdict(
+        verdictLabel(a.verdict, a.detected_category?.category).toUpperCase(),
+        band.rgb,
+      );
     }
 
     if (nn?.food_type === "staple_ingredient" && nScore != null) {

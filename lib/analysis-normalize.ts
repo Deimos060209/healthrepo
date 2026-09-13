@@ -33,6 +33,7 @@ import type {
   NutrientLevel,
   ThresholdFlag,
   Verdict,
+  ProductPurpose,
 } from "@/types/analysis";
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -191,6 +192,8 @@ const DETECTED_CATEGORY_IDS: readonly string[] = [
   "household_cleaning",
   "baby_product_food",
   "baby_product_care",
+  "general_merchandise",
+  "drug_or_medical",
   "unknown",
 ];
 const detectedCategoryId = (v: unknown): DetectedCategoryId => {
@@ -200,6 +203,8 @@ const detectedCategoryId = (v: unknown): DetectedCategoryId => {
     .replace(/[\s-]+/g, "_");
   if (DETECTED_CATEGORY_IDS.includes(s)) return s as DetectedCategoryId;
   // Tolerate near-misses from the model.
+  if (s.includes("drug") || s.includes("medic") || s.includes("pharma"))
+    return "drug_or_medical";
   if (s.includes("baby") && (s.includes("care") || s.includes("cosmetic")))
     return "baby_product_care";
   if (s.includes("baby") || s.includes("infant")) return "baby_product_food";
@@ -209,7 +214,28 @@ const detectedCategoryId = (v: unknown): DetectedCategoryId => {
     return "personal_care";
   if (s.includes("food") || s.includes("beverage") || s.includes("drink"))
     return "food_and_beverages";
+  if (
+    s.includes("merchandise") ||
+    s.includes("stationery") ||
+    s.includes("electronics") ||
+    s.includes("hardware") ||
+    s.includes("general")
+  )
+    return "general_merchandise";
   return "unknown";
+};
+
+const PRODUCT_PURPOSES: readonly string[] = [
+  "hydration",
+  "seasoning",
+  "condiment",
+  "beverage",
+  "staple_food",
+  "snack_or_meal",
+];
+const productPurpose = (v: unknown): ProductPurpose | null => {
+  const s = String(v ?? "").toLowerCase().trim().replace(/[\s-]+/g, "_");
+  return PRODUCT_PURPOSES.includes(s) ? (s as ProductPurpose) : null;
 };
 
 const CONFIDENCE_LEVELS: readonly string[] = ["high", "medium", "low"];
@@ -475,17 +501,15 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
   const oa = isObj(r.overall_assessment) ? r.overall_assessment : {};
   const rawSafety = scoreOrNull(oa.safety_score);
   const rawCompliance = scoreOrNull(oa.compliance_score);
-  // Force "insufficient" when the model said so, when it returned no score, when
-  // it found no ingredients (cannot score safety), or when too much of the
-  // label was unreadable (cannot score compliance).
-  const safetyInsufficient =
-    rawSafety === null ||
-    /insufficient/i.test(String(oa.safety_status ?? "")) ||
-    ingredient_analysis.length === 0;
-  const complianceInsufficient =
-    rawCompliance === null ||
-    /insufficient/i.test(String(oa.compliance_status ?? "")) ||
-    assessableComplianceCount < 2;
+  // FIX 8.2 — narrowed gates. The model's own null / "insufficient_data" is
+  // advisory only: lib/enrich-analysis.ts computes the real score locally from
+  // ingredient_analysis / legal_metrology_compliance whenever there is enough
+  // to compute FROM, so the model firing its (over-eager) anti-hallucination
+  // instinct on a perfectly readable label must not be able to null a score
+  // that local arithmetic can produce. These are the ONLY two conditions that
+  // can null a score at all:
+  const safetyInsufficient = ingredient_analysis.length === 0;
+  const complianceInsufficient = assessableComplianceCount < 2;
 
   // TEMP DEBUG — log which exact sub-condition nulled a score. Remove with the
   // ANALYZE_DEBUG / HAIKU_ROUTER_DEBUG logging in app/api/analyze/route.ts.
@@ -495,21 +519,17 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
       "INSUFFICIENT_GATE_DEBUG",
       JSON.stringify({
         safety_insufficient: safetyInsufficient,
-        safety_trigger: safetyInsufficient
-          ? rawSafety === null
-            ? `rawSafety===null (model sent ${JSON.stringify(oa.safety_score)})`
-            : /insufficient/i.test(String(oa.safety_status ?? ""))
-              ? `model safety_status="${oa.safety_status}"`
-              : `ingredient_analysis.length===0`
-          : null,
+        safety_trigger: safetyInsufficient ? "ingredient_analysis.length===0" : null,
         compliance_insufficient: complianceInsufficient,
         compliance_trigger: complianceInsufficient
-          ? rawCompliance === null
-            ? `rawCompliance===null (model sent ${JSON.stringify(oa.compliance_score)})`
-            : /insufficient/i.test(String(oa.compliance_status ?? ""))
-              ? `model compliance_status="${oa.compliance_status}"`
-              : `assessableComplianceCount<2 (was ${assessableComplianceCount})`
+          ? `assessableComplianceCount<2 (was ${assessableComplianceCount})`
           : null,
+        // The model's own raw scores/status are advisory only (FIX 8.1/8.2) —
+        // logged here for comparison against what enrichAnalysis() computes.
+        model_sent_null_safety: rawSafety === null,
+        model_safety_status: oa.safety_status ?? null,
+        model_sent_null_compliance: rawCompliance === null,
+        model_compliance_status: oa.compliance_status ?? null,
         raw_safety_score: rawSafety,
         raw_compliance_score: rawCompliance,
         ingredient_count: ingredient_analysis.length,
@@ -574,11 +594,19 @@ export function normalizeAnalysis(raw: unknown): ProductAnalysis {
       suggested_status: safetyStatus(v.suggested_status),
     }));
 
+  const early_verdict =
+    String(r.early_verdict ?? "").toLowerCase().trim() === "no_label_content"
+      ? ("no_label_content" as const)
+      : null;
+
   return {
     product_info,
     detected_category: normalizeDetectedCategory(r.detected_category),
     verdict,
     verdict_reason,
+    early_verdict,
+    product_purpose: productPurpose(r.product_purpose),
+    purpose_note: str(r.purpose_note),
     key_findings,
     legal_metrology_compliance,
     ingredient_analysis,

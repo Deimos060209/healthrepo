@@ -2413,6 +2413,54 @@ export const PRODUCT_CATEGORY_RULES: Record<string, ProductCategoryRule> = {
       "Check against EU children's-cosmetics standards (stricter than India)",
     ],
   },
+
+  // FIX 7 — non-food, non-cosmetic packaged commodities (stationery,
+  // electronics, hardware, kitchenware, textiles, footwear, toys, batteries).
+  // These carry no ingredients or nutrition panel — that absence is NEVER a
+  // reason to reject them as "not a packaged product".
+  general_merchandise: {
+    regulatory_body: "Legal Metrology Department, Department of Consumer Affairs",
+    act: "Legal Metrology Act 2009 and Legal Metrology (Packaged Commodities) Rules 2011",
+    complaint_portal: "https://consumerhelpline.gov.in",
+    required_labels: [
+      "Generic name of the commodity",
+      "Net quantity or unit count",
+      "MRP (inclusive of all taxes)",
+      "Manufacturer/importer/packer name and address",
+      "Month and year of manufacture or import",
+      "Consumer care details",
+      "Country of origin (for imported goods)",
+      "Dimensions (where relevant, e.g. tools, textiles)",
+    ],
+    additional_checks: [
+      "Do NOT check or flag ingredients, nutrition, FSSAI licence, allergens, veg/non-veg symbol or best-before — none apply",
+      "safety_score is null unless a genuine material hazard is declared on the pack (sharp, flammable, choking hazard, battery)",
+    ],
+  },
+
+  // FIX 7 — medicines and medical devices. HealthRepo checks LABELLING
+  // COMPLIANCE ONLY here and never gives a safety verdict on the active
+  // ingredients — that is a matter for a pharmacist or doctor, not this app.
+  drug_or_medical: {
+    regulatory_body: "CDSCO under the Drugs and Cosmetics Act 1940",
+    act: "Drugs and Cosmetics Act, 1940",
+    complaint_portal: "https://cdsco.gov.in/opencms/opencms/en/consumer-corner/",
+    required_labels: [
+      "Drug licence number",
+      "Batch number",
+      "Manufacture and expiry dates",
+      "MRP",
+      "Manufacturer name and address",
+      "Composition / active ingredients (declared, not safety-scored)",
+      "Storage instructions",
+      "Prescription status (Rx / Schedule H, if applicable)",
+    ],
+    additional_checks: [
+      "NEVER give a safety verdict — safe or unsafe — on the active ingredients",
+      "nutrition_score is always null",
+      "Always display: 'This is a medicinal product. HealthRepo checks labelling compliance only. Consult a pharmacist or doctor about whether this medicine is right for you.'",
+    ],
+  },
 };
 
 export interface PersonalCareBannedIngredient {
@@ -2715,6 +2763,8 @@ export type CompactReferenceCategory =
   | "household_cleaning"
   | "baby_product_food"
   | "baby_product_care"
+  | "general_merchandise"
+  | "drug_or_medical"
   | "unknown";
 
 /**
@@ -2728,10 +2778,14 @@ export function normalizeCompactCategory(v: string): CompactReferenceCategory {
     s === "personal_care" ||
     s === "household_cleaning" ||
     s === "baby_product_food" ||
-    s === "baby_product_care"
+    s === "baby_product_care" ||
+    s === "general_merchandise" ||
+    s === "drug_or_medical"
   ) {
     return s;
   }
+  if (s.includes("drug") || s.includes("medic") || s.includes("pharma"))
+    return "drug_or_medical";
   if (
     s.includes("baby") &&
     (s.includes("care") ||
@@ -2756,6 +2810,15 @@ export function normalizeCompactCategory(v: string): CompactReferenceCategory {
     return "personal_care";
   if (s.includes("food") || s.includes("beverage") || s.includes("drink"))
     return "food_and_beverages";
+  if (
+    s.includes("merchandise") ||
+    s.includes("stationery") ||
+    s.includes("electronics") ||
+    s.includes("hardware") ||
+    s.includes("general")
+  ) {
+    return "general_merchandise";
+  }
   return "unknown";
 }
 

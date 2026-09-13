@@ -540,6 +540,60 @@ function readFileAsBase64(file: File): Promise<VisionImagePayload> {
   });
 }
 
+// ---------------------------------------------------------------------------
+// FIX 1.2 — narration detection for the Vision OCR tiers
+// ---------------------------------------------------------------------------
+
+const NARRATION_OPENERS = [
+  "based on",
+  "this appears",
+  "this looks like",
+  "the image shows",
+  "i can see",
+  "here's what",
+  "here is what",
+  "looking at",
+  "the label shows",
+  "it seems",
+];
+
+const NARRATION_PHRASES = [
+  "appears to be",
+  "i can make out",
+  "partially readable",
+  "difficult to read",
+  "due to the curvature",
+  "blurry",
+  "the photo",
+];
+
+/** A markdown heading the model invented ("**Product Type:**") rather than transcribed. */
+const NARRATION_HEADING_RE = /\*\*[A-Z][a-z]+(?:\/[A-Z][a-z]+)?(?:\s+[A-Z][a-z]+)*\s*(?:\([^)]*\))?:\*\*/;
+
+/**
+ * True when a Vision OCR tier described the photo instead of transcribing the
+ * label — "Based on the image, this appears to be an eye drop bottle..." — a
+ * failure mode that otherwise slips past {@link validateExtractedText} because
+ * narration happens to mention words like "ingredients" or "MRP" while
+ * containing no actual label data.
+ */
+export function looksLikeNarration(text: string): boolean {
+  const t = text.trim().toLowerCase();
+  if (!t) return false;
+
+  if (NARRATION_OPENERS.some((p) => t.startsWith(p))) return true;
+
+  const phraseHits = NARRATION_PHRASES.reduce(
+    (n, p) => n + (t.includes(p) ? 1 : 0),
+    0,
+  );
+  if (phraseHits >= 2) return true;
+
+  if (NARRATION_HEADING_RE.test(text)) return true;
+
+  return false;
+}
+
 /** Human-readable message for an error, whether or not it is an `OcrError`. */
 export function ocrErrorMessage(err: unknown): string {
   if (err instanceof OcrError) return err.message;

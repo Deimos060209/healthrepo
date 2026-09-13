@@ -43,7 +43,29 @@ export type DetectedCategoryId =
   | "household_cleaning"
   | "baby_product_food"
   | "baby_product_care"
+  | "general_merchandise"
+  | "drug_or_medical"
   | "unknown";
+
+/**
+ * BUG 2/3 fix — the dietary role a food/beverage product plays. Determines
+ * whether (and how) nutritional scoring applies. null for non-food categories.
+ * - 'hydration'    — plain water, unsweetened clear beverages. No nutrition score.
+ * - 'seasoning'    — salt, spices, masalas, herbs. No nutrition score, no sodium
+ *                     threshold, no ultra-processed rule.
+ * - 'condiment'    — pickles, chutneys, sauces eaten in small amounts. Scored,
+ *                     but threshold penalties are halved (per-serving reasoning).
+ * - 'beverage'     — juices, soft drinks, tea, coffee — consumed in volume.
+ * - 'staple_food'  — grains, flours, pulses, oils, dairy.
+ * - 'snack_or_meal'— biscuits, chips, ready meals, confectionery, cereals.
+ */
+export type ProductPurpose =
+  | "hydration"
+  | "seasoning"
+  | "condiment"
+  | "beverage"
+  | "staple_food"
+  | "snack_or_meal";
 
 export interface DetectedCategory {
   category: DetectedCategoryId;
@@ -403,6 +425,16 @@ export interface ProductAnalysis {
   verdict: Verdict;
   /** One sentence backing the verdict, <= 20 words. */
   verdict_reason: string;
+  /**
+   * BUG 8.3 — set ONLY when the extracted text contains no product label
+   * content at all (no ingredients, no declarations, nothing printed). The
+   * one and only signal for the rare genuine "unscoreable scan" screen.
+   */
+  early_verdict?: "no_label_content" | null;
+  /** BUG 2/3 — the dietary role this product plays. null for non-food categories. */
+  product_purpose?: ProductPurpose | null;
+  /** One line explaining the product_purpose classification. */
+  purpose_note?: string | null;
   /** 2-4 short headline findings, each under ~12 words. */
   key_findings: string[];
   legal_metrology_compliance: LegalMetrologyCompliance;
